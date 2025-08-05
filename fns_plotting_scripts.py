@@ -337,6 +337,34 @@ def test_train_split_cells_v2(data,feature,target,train_size=0.5):
     
     return feat_train,feat_test,tar_train,tar_test,metricdist_train,metricdist_test,markers_train,markers_test
 
+# IH 250805: added by Bassit, possibly redundantly, resolve later
+def test_train_split_cells_half_colonies(data,feature,target):
+    #include metricdist in output
+    N_tar = target.shape[2]
+    N_sys = data.N_sys
+    
+    feature_clean,target_clean,colonies_clean, metricdist_clean,markers_clean = clean_data_full(data,feature,target)
+    N_entries = len(feature_clean)
+    colony_choice = np.unique(colonies_clean)
+    colonies_train = np.random.choice(colony_choice, int(N_sys/2), replace=False)
+    mask = np.isin(colonies_clean, colonies_train)
+    print(colonies_train)
+
+    feat_train = feature_clean[mask]
+    tar_train = target_clean[mask]
+    metricdist_train = metricdist_clean[mask].ravel()
+    markers_train = markers_clean[mask].ravel()
+    
+    feat_test = feature_clean[~mask]
+    tar_test = target_clean[~mask]
+    metricdist_test = metricdist_clean[~mask].ravel()
+    markers_test = markers_clean[~mask].ravel()
+    
+    if N_tar == 1:
+        tar_train = tar_train.ravel()
+        tar_test = tar_test.ravel()
+    
+    return feat_train,feat_test,tar_train,tar_test,metricdist_train,metricdist_test,markers_train,markers_test
 
 
 def test_train_split_cells_classbal(data,feature,target,train_size=0.5):
@@ -623,12 +651,11 @@ def calc_profile_poserror(X,pos_all,N_bins_x,r_max,overlap=1):
     
     return bins_x,mean_x,var_x,pos_error,bins_x_sym,C_matrix_x
 
-
-def calc_poserror_smooth(X,pos_all,N_bins_x_raw,r_max,N_bins_x=1000,lam=100):
+def calc_poserror_smooth(X,pos_all,N_bins_x_raw,r_max, reg_term = 0.0, N_bins_x=1000,lam=100):
 
     bins_x_raw,mean_x_raw,var_x_raw,pos_error_raw,P_x_raw,C_matrix_x_raw = calc_profile_poserror(X,pos_all,N_bins_x_raw,r_max)
     
-    from scipy.interpolate import make_smoothing_spline
+    from scipy.interpolate import make_smoothing_spline, make_splrep, make_interp_spline, CubicSpline
 
     N_var = X.shape[2]
     bins_x = np.linspace(bins_x_raw[0],bins_x_raw[-1],N_bins_x)
@@ -637,11 +664,17 @@ def calc_poserror_smooth(X,pos_all,N_bins_x_raw,r_max,N_bins_x=1000,lam=100):
     var_x = np.zeros((N_bins_x,N_var))
     C_matrix_x = np.zeros((N_bins_x,N_var,N_var))
     for k in range(0,N_var):
-        func_interp_av = make_smoothing_spline(bins_x_raw, mean_x_raw[:,k], lam=lam)
+        func_interp_av = make_smoothing_spline(bins_x_raw, mean_x_raw[:,k], lam = lam)
+        # func_interp_av = make_splrep(bins_x_raw, mean_x_raw[:,k], s = 0)
+        
+        #func_interp_av = CubicSpline(bins_x_raw, mean_x_raw[:,k])
+        
         mean_x[:,k] = func_interp_av(bins_x)
         
         for k2 in range(0,N_var):
-            func_interp_covar = make_smoothing_spline(bins_x_raw, C_matrix_x_raw[:,k,k2], lam=lam)
+            func_interp_covar = make_smoothing_spline(bins_x_raw, C_matrix_x_raw[:,k,k2], lam = lam)
+            # func_interp_covar = make_splrep(bins_x_raw, C_matrix_x_raw[:,k,k2])
+            #func_interp_covar = CubicSpline(bins_x_raw, C_matrix_x_raw[:,k,k2])
             C_matrix_x[:,k,k2] = func_interp_covar(bins_x)
             
             if k==k2:
@@ -652,7 +685,7 @@ def calc_poserror_smooth(X,pos_all,N_bins_x_raw,r_max,N_bins_x=1000,lam=100):
 
     C_matrix_x_inv = np.zeros((N_bins_x,N_var,N_var))
     for b_x in range(0,N_bins_x):
-        C_matrix_x_inv[b_x,:,:] = np.linalg.inv(C_matrix_x[b_x,:,:])
+        C_matrix_x_inv[b_x,:,:] = np.linalg.pinv(C_matrix_x[b_x,:,:] + np.eye(N_var)*reg_term)
 
     sum_pos_error=0
     for i in range(0,N_var):
@@ -661,7 +694,6 @@ def calc_poserror_smooth(X,pos_all,N_bins_x_raw,r_max,N_bins_x=1000,lam=100):
     pos_error = np.sqrt(1/sum_pos_error)
     
     return bins_x,mean_x,var_x,pos_error,bins_x_sym,C_matrix_x
-
 
 
 def calc_regression_poserror(target_predict,tar_test,pos_all,N_bins_x,r_max):
