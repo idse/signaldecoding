@@ -99,7 +99,7 @@ class Colony(Position):
         margin = self.radiusMicron/10;
         maxR = self.radiusMicron + margin
         # I am adding 10% negative R values to the grid on which it will linearly extrapolate, to deal with boundary effects for smoothing on the edge 
-        # (positional error goes high on edge because mirroring the data for smoothing makes the gradient zero there)
+        # (otherwise positional error goes high on edge because mirroring the data for smoothing makes the gradient zero there)
         Ngrid = round((maxR + margin)/dr)
         self.radialGrid = np.linspace(-margin, maxR, Ngrid)
         
@@ -357,11 +357,11 @@ class MPexperiment(Experiment):
             
     def plotRadialProfiles(self, channel, condition, mode='cells', sigma=0):
 
-        r = self.radialGrids[cond];
+        r = self.radialGrids[condition];
         # cut off the plots where there is no data
         # actual bin radii may be off from true radius by dr so keeping some margin, also dr stored after Colony.calcRadialProfiles, clean up later
         dr = 10
-        idx = r < exp.trueRadiusMicron[cond] + dr 
+        idx = r < self.trueRadiusMicron[condition] + dr 
 
         if mode=='cells':
 
@@ -382,7 +382,7 @@ class MPexperiment(Experiment):
             
         elif mode=='colonies_individual':
 
-            conditionCols = [c for c in self.positions.values() if c.condition==cond]
+            conditionCols = [c for c in self.positions.values() if c.condition==condition]
             for c in conditionCols:
                 plt.plot(r[idx], c.radialProfiles[channel][idx])
                 plt.legend([c.ID for c in conditionCols]);
@@ -390,7 +390,7 @@ class MPexperiment(Experiment):
         plt.gca().set_box_aspect(1)
         plt.ylabel("intensity")
         plt.xlabel(r"edge distance ($\mu m$)")
-        plt.xlim((0, self.radiusMicron[cond]));
+        plt.xlim((0, self.radiusMicron[condition]));
 
     
     def plotPosError(self, condition, channel, mode='et', sigma=0):
