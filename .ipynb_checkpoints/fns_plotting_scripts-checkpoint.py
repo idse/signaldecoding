@@ -24,9 +24,10 @@ def return_colmaps(mode,N_var=None):
     elif mode == 'fates':
         #cmap = mpl.cm.get_cmap('tab10')
         #colors = cmap(list(np.linspace(0,1,10)))
+        # ['amnion','PGCLC','PS','meso','pluri','ecto','other']
         colors = np.array([[90/255,166/255,71/255,1],[227/255,143/255,52/255,1],
                  [211/255,62/255,43/255,1], [140/255,40/255,93/255,1],
-                 [75/255,167/255,158/255,1], [49/255,118/255,181/255,1]])
+                 [75/255,167/255,158/255,1], [49/255,118/255,181/255,1], [0.9,0.9,0.9,1]])
     elif mode == 'signals':
         if N_var==None:
             N_var = 7
