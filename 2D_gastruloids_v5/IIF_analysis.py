@@ -3,6 +3,58 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import scipy.interpolate as interp
 from scipy.ndimage import gaussian_filter1d
+import fns_plotting_scripts as fns_plot
+
+def return_fates(data, thresh=1):
+    """
+    define fates based on fate marker expression
+    """
+
+    fate_names = ['AMLC','PGCLC','PSLC','meso','pluri','ecto', 'other']
+
+    if thresh==1:
+        thresh = {'TFAP2C':1, 'SOX17':1, 'NANOG':1, 'ISL1':1, 'TBXT':1, 'TBX6':1, 'SOX2':1}
+    
+    TFAP2C = data['TFAP2C'] > thresh['TFAP2C']
+    SOX17 = data['SOX17'] > thresh['SOX17']
+    NANOG = data['NANOG'] > thresh['NANOG']
+    ISL1 = data['ISL1'] > thresh['ISL1']
+    TBXT = data['TBXT'] > thresh['TBXT']
+    TBX6 = data['TBX6'] > thresh['TBX6']
+    SOX2 = data['SOX2'] > thresh['SOX2']
+
+    TBXT_scaled = data['TBXT']/thresh['TBXT']
+    NANOG_scaled = data['NANOG']/thresh['NANOG']
+    SOX2_scaled = data['SOX2']/thresh['SOX2']
+
+    PGCLC = TFAP2C & SOX17 
+    meso = TBXT & TBX6 & ~PGCLC
+    AMLC = ISL1 & ~PGCLC & ~meso
+    PSLC = (TBXT_scaled > SOX2_scaled) & (data['TBXT'] > 100) & ~TBX6 & ~PGCLC & ~AMLC
+    pluri = NANOG & SOX2 & ~PGCLC & ~meso & ~PSLC & ~AMLC
+    ecto = ~NANOG & (SOX2_scaled > TBXT_scaled) & (data['SOX2'] > 100) & ~PGCLC & ~meso & ~PSLC & ~AMLC
+    #AMLC = (AMLC | TFAP2C) & ~(ecto | pluri | PSLC | meso | PGCLC)
+    other = ~(ecto | pluri | PSLC | AMLC | meso | PGCLC)
+
+    # # OLD defs
+    # PGCLC = TFAP2C & SOX17 
+    # meso = TBXT & TBX6 & ~PGCLC
+    # AMLC = ISL1 & ~PGCLC & ~meso
+    # PSLC = TBXT & ~SOX2 & ~TBX6 & ~PGCLC & ~AMLC
+    # pluri = SOX2 & NANOG & ~PGCLC & ~meso & ~PSLC & ~AMLC
+    # ecto = ~NANOG & SOX2 & ~PGCLC & ~meso & ~PSLC & ~AMLC 
+    # other = ~(ecto | pluri | PSLC | AMLC | meso | PGCLC)
+
+    labels = np.empty(data.shape[0], dtype='<U5')  # or dtype=str
+    labels[PGCLC] = "PGCLC"
+    labels[meso] = "meso"
+    labels[AMLC] = "AMLC"
+    labels[PSLC] = "PSLC"
+    labels[pluri] = "pluri"
+    labels[ecto] = "ecto"
+    labels[other] = "other"
+    
+    return labels, fate_names
 
 class Metadata: 
 
@@ -50,6 +102,27 @@ class Position:
         plt.scatter(self.cellData['XY']['X'][order], self.cellData['XY']['Y'][order], s=ms, c=color[order], cmap='YlGnBu', vmin=vmin, vmax=vmax)
         plt.axis('square');
         plt.axis('off');
+
+    def scatter_fates(self, ms=10, legend=True, ax=None, thresh=1):
+
+        data = self.cellData['intensities'];
+        marker_clusters, fate_names = return_fates(data, thresh)
+        colors = fns_plot.return_colmaps('fates')
+
+        if ax==None:
+            fig, ax = plt.subplots(1,1)
+        
+        for i, cl in enumerate(fate_names):
+
+            idx = marker_clusters==cl;
+            X = self.cellData['XY']['X'][idx]
+            Y = self.cellData['XY']['Y'][idx]
+            scatter = ax.scatter(X,Y,color=colors[i], s=ms, edgecolors='none');
+            
+        if legend:
+            ax.legend(fate_names)
+        ax.set_aspect('equal') 
+        ax.axis('off');
         
 class Colony(Position):
     # Colony extends Position to include features and methods specific to disc-shaped micropatterned colonies, like radiusMicron and makeRadialProfile(..)

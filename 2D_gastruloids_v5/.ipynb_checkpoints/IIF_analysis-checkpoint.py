@@ -3,6 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import scipy.interpolate as interp
 from scipy.ndimage import gaussian_filter1d
+import fns_plotting_scripts as fns_plot
 
 def return_fates(data, thresh=1):
     """
@@ -107,14 +108,16 @@ class Position:
         data = self.cellData['intensities'];
         marker_clusters, fate_names = return_fates(data, thresh)
         colors = fns_plot.return_colmaps('fates')
+
+        if ax==None:
+            fig, ax = plt.subplots(1,1)
         
         for i, cl in enumerate(fate_names):
-        
+
             idx = marker_clusters==cl;
-            X = data.loc[idx]['X']
-            Y = data.loc[idx]['Y']
-            C = marker_clusters
-            scatter = ax.scatter(X,Y,color=colors[i], s=s, edgecolors='none');
+            X = self.cellData['XY']['X'][idx]
+            Y = self.cellData['XY']['Y'][idx]
+            scatter = ax.scatter(X,Y,color=colors[i], s=ms, edgecolors='none');
             
         if legend:
             ax.legend(fate_names)
