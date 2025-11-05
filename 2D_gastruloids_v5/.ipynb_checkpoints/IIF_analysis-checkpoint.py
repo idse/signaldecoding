@@ -3,14 +3,20 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import scipy.interpolate as interp
 from scipy.ndimage import gaussian_filter1d
-import fns_plotting_scripts as fns_plot
+import sklearn
+import torch
 
+import sys
+sys.path.append('/Users/idse/repos/signaldecoding/2D_gastruloids_v5')
+import fns_plotting_scripts as fns_plot
+import fns_NN
+    
 def return_fates(data, thresh=1):
     """
     define fates based on fate marker expression
     """
-
-    fate_names = ['AMLC','PGCLC','PSLC','meso','pluri','ecto', 'other']
+    
+    fate_names = ['AMLC','PGCLC','PSLC','meso','pluri','ecto', 'endo', 'other']
 
     if thresh==1:
         thresh = {'TFAP2C':1, 'SOX17':1, 'NANOG':1, 'ISL1':1, 'TBXT':1, 'TBX6':1, 'SOX2':1}
@@ -27,14 +33,26 @@ def return_fates(data, thresh=1):
     NANOG_scaled = data['NANOG']/thresh['NANOG']
     SOX2_scaled = data['SOX2']/thresh['SOX2']
 
+    # PGCLC = TFAP2C & SOX17 
+    # endo = SOX17 & ~PGCLC
+    # meso = TBXT & TBX6 & ~PGCLC & ~endo
+    # AMLC = ISL1 & ~PGCLC & ~meso & ~endo
+    # PSLC = (TBXT_scaled > SOX2_scaled) & (data['TBXT'] > 100) & ~TBX6 & ~PGCLC & ~AMLC & ~endo
+    # pluri = NANOG & SOX2 & ~PGCLC & ~meso & ~PSLC & ~AMLC
+    # ecto = ~NANOG & (SOX2_scaled > TBXT_scaled) & (data['SOX2'] > 100) & ~PGCLC & ~meso & ~PSLC & ~AMLC & ~endo
+    # AMLC = (AMLC | TFAP2C) & ~(ecto | pluri | PSLC | meso | PGCLC | endo)
+    # other = ~(ecto | pluri | PSLC | AMLC | meso | PGCLC | endo)
+
     PGCLC = TFAP2C & SOX17 
-    meso = TBXT & TBX6 & ~PGCLC
-    AMLC = ISL1 & ~PGCLC & ~meso
-    PSLC = (TBXT_scaled > SOX2_scaled) & (data['TBXT'] > 100) & ~TBX6 & ~PGCLC & ~AMLC
-    pluri = NANOG & SOX2 & ~PGCLC & ~meso & ~PSLC & ~AMLC
-    ecto = ~NANOG & (SOX2_scaled > TBXT_scaled) & (data['SOX2'] > 100) & ~PGCLC & ~meso & ~PSLC & ~AMLC
-    #AMLC = (AMLC | TFAP2C) & ~(ecto | pluri | PSLC | meso | PGCLC)
-    other = ~(ecto | pluri | PSLC | AMLC | meso | PGCLC)
+    endo = SOX17 & ~PGCLC
+    meso = TBXT & TBX6 & ~PGCLC & ~endo
+    AMLC = ISL1 & ~PGCLC & ~meso & ~endo 
+    ecto = ~NANOG & (SOX2_scaled > TBXT_scaled) & (data['SOX2'] > 100) & ~PGCLC & ~meso & ~endo & ~AMLC 
+    PSLC = (TBXT_scaled > NANOG_scaled) & TBXT & ~PGCLC & ~meso & ~endo & ~AMLC & ~ecto # (data['TBXT'] > 100)
+    pluri = (NANOG_scaled > TBXT_scaled) & NANOG & SOX2 & ~PGCLC & ~meso & ~endo & ~AMLC & ~ecto & ~PSLC 
+    AMLC = (AMLC | TFAP2C) & ~(ecto | pluri | PSLC | meso | PGCLC | endo)
+    other = ~(ecto | pluri | PSLC | AMLC | meso | PGCLC | endo)
+
 
     # # OLD defs
     # PGCLC = TFAP2C & SOX17 
@@ -48,6 +66,7 @@ def return_fates(data, thresh=1):
     labels = np.empty(data.shape[0], dtype='<U5')  # or dtype=str
     labels[PGCLC] = "PGCLC"
     labels[meso] = "meso"
+    labels[endo] = "endo"
     labels[AMLC] = "AMLC"
     labels[PSLC] = "PSLC"
     labels[pluri] = "pluri"
@@ -55,6 +74,123 @@ def return_fates(data, thresh=1):
     labels[other] = "other"
     
     return labels, fate_names
+
+class VIB:
+
+    def __init__(self, feat_train, tar_train):
+
+        # VIB model parameters (for signal input)
+        LATENT_DIM = 2
+        HIDDEN_DIM = 64
+        N_LAYERS = 2
+        EPOCHS = 800
+        LEARNING_RATE = 1e-3
+        BETA = 0.01
+
+        N_DIM_INPUT = feat_train.shape[1]
+        N_DIM_OUTPUT = tar_train.shape[1]
+
+        self.tar_train = tar_train
+        
+        # Standardize
+        self.scaler_X_run = sklearn.preprocessing.StandardScaler()
+        self.scaler_Y_run = sklearn.preprocessing.StandardScaler()
+        
+        feat_train_z = self.scaler_X_run.fit_transform(feat_train)
+        tar_train_z = self.scaler_Y_run.fit_transform(tar_train)
+        
+        # Convert to torch
+        X_train_run = torch.FloatTensor(feat_train_z)
+        Y_train_run = torch.FloatTensor(tar_train_z)
+        
+        # Create new VIB model (fresh random initialization each run)
+        self.model = fns_NN.FlexibleVIB(
+            input_dim=N_DIM_INPUT,
+            output_dim=N_DIM_OUTPUT,
+            latent_dim=LATENT_DIM,
+            hidden_dim=HIDDEN_DIM,
+            n_layers=N_LAYERS,
+            encoder_type='nonlinear',
+            decoder_type='nonlinear'
+        )
+        
+        # Train
+        _ = fns_NN.train_model(
+            self.model, X_train_run, Y_train_run,
+            is_vae=False,
+            epochs=EPOCHS,
+            lr=LEARNING_RATE,
+            beta=BETA,
+            verbose=False
+        )
+
+    def predict(self, feat_test):
+        
+        feat_test_z = self.scaler_X_run.transform(feat_test)
+        X_test_run = torch.FloatTensor(feat_test_z)
+
+        self.model.eval()
+        with torch.no_grad():
+            target_predict_z = self.model(X_test_run)[0].numpy()
+
+        # Inverse transform
+        target_predict = self.scaler_Y_run.inverse_transform(target_predict_z)
+
+        # convert back to dataframe if appropriate
+        if type(feat_test) == pd.core.frame.DataFrame and type(self.tar_train) == pd.core.frame.DataFrame:
+            target_predict = pd.DataFrame(target_predict, index=feat_test.index, columns=self.tar_train.columns)
+    
+        return target_predict
+
+
+# # convert data to David's format 
+# def data2david(data, features):
+
+#     # Step 1: Features and Colonies
+#     df = data[features + ['Colony']]
+#     features = [c for c in df.columns if c != 'Colony']
+#     colonies = sorted(df['Colony'].unique())
+#     n_colonies = len(colonies)
+#     n_features = len(features)
+
+#     # Step 2: Max cells per colony
+#     max_cells = df.groupby('Colony').size().max()
+
+#     # Initialize array: (colonies, cells, features)
+#     arr = np.full((n_colonies, max_cells, n_features), np.nan)
+    
+#     # Fill
+#     for i, colony_num in enumerate(colonies):
+#         colony_data = df[df['Colony'] == colony_num][features].values
+#         arr[i, :len(colony_data), :] = colony_data
+    
+#     return arr
+    
+# def test_train_split_colonies(feature, target, train_size=3):
+
+#     # Split test/train by colony
+#     N_sys = feature.shape[0]
+#     N_tar = target.shape[2]
+    
+#     test_size = N_sys - train_size
+    
+#     # Use first N=test_size colonies for testing, so colony 1 can be used for plotting
+#     feature_test = feature[:test_size, :, :]
+#     target_test = target[:test_size, :, :]
+    
+#     # Use last colonies for training
+#     feature_train = feature[-train_size:, :, :] 
+#     target_train = target[-train_size:, :, :]
+
+#     feat_train, tar_train, _ = fns_NN.clean_data(feature_train, target_train)
+#     feat_test, tar_test, _ = fns_NN.clean_data(feature_test, target_test)
+
+#     if N_tar == 1:
+#         tar_train = tar_train.ravel()
+#         tar_test = tar_test.ravel()
+    
+#     return (feat_train, feat_test, tar_train, tar_test)
+
 
 class Metadata: 
 
@@ -104,7 +240,7 @@ class Position:
         plt.axis('off');
 
     def scatter_fates(self, ms=10, legend=True, ax=None, thresh=1):
-
+        
         data = self.cellData['intensities'];
         marker_clusters, fate_names = return_fates(data, thresh)
         colors = fns_plot.return_colmaps('fates')
@@ -428,7 +564,7 @@ class MPexperiment(Experiment):
                 # conditionPosVars = [c.posError**2 for c in conditionCols];
                 # self.posErrorIntrinsic[cond] = pd.concat(conditionPosVars).groupby(level=0).mean().applymap(np.sqrt)
             
-    def plotRadialProfiles(self, channel, condition, mode='cells', sigma=0):
+    def plotRadialProfiles(self, channel, condition, mode='cells', sigma=0, color = 'blue', ax=None):
 
         r = self.radialGrids[condition];
         # cut off the plots where there is no data
@@ -436,34 +572,38 @@ class MPexperiment(Experiment):
         dr = 10
         idx = r < self.trueRadiusMicron[condition] + dr 
 
+        if ax is None:
+            _, ax = plt.subplots(1,1)
+        
         if mode=='cells':
 
-            y = self.radialProfilesTotal[condition][channel];
-            yerr = self.radialProfilesTotal_std[condition][channel];
+            y = self.radialProfilesTotal[condition][channel]
+            yerr = self.radialProfilesTotal_std[condition][channel]
             if sigma>0:
                 y = gaussian_filter1d(y, sigma=sigma)
                 yerr = gaussian_filter1d(yerr, sigma=sigma)
-            plt.plot(r[idx], y[idx])
-            plt.fill_between(r[idx], y[idx] - yerr[idx], y[idx] + yerr[idx], alpha=0.3, color='blue', edgecolor='none')
+            ax.plot(r[idx], y[idx], color=color)
+            ax.fill_between(r[idx], y[idx] - yerr[idx], y[idx] + yerr[idx], alpha=0.3, color=color, edgecolor='none')
         
         elif mode=='colonies':
 
-            y = self.radialProfiles[condition][channel];
-            yerr = self.radialProfiles_std[condition][channel];
-            plt.plot(r[idx], y[idx])
-            plt.fill_between(r[idx], y[idx] - yerr[idx], y[idx] + yerr[idx], alpha=0.3, color='blue', edgecolor='none')
+            y = self.radialProfiles[condition][channel]
+            yerr = self.radialProfiles_std[condition][channel]
+            ax.plot(r[idx], y[idx], color=color)
+            ax.fill_between(r[idx], y[idx] - yerr[idx], y[idx] + yerr[idx], alpha=0.3, color=color, edgecolor='none')
             
         elif mode=='colonies_individual':
 
             conditionCols = [c for c in self.positions.values() if c.condition==condition]
             for c in conditionCols:
-                plt.plot(r[idx], c.radialProfiles[channel][idx])
-                plt.legend([c.ID for c in conditionCols]);
+                ax.plot(r[idx], c.radialProfiles[channel][idx], color=color)
+                ax.legend([c.ID for c in conditionCols])
         
-        plt.gca().set_box_aspect(1)
-        plt.ylabel("intensity")
-        plt.xlabel(r"edge distance ($\mu m$)")
-        plt.xlim((0, self.radiusMicron[condition]));
+        ax.set_box_aspect(1)
+        ax.set_ylabel("intensity")
+        ax.set_xlabel(r"edge distance ($\mu m$)")
+        ax.set_xlim((0, self.radiusMicron[condition]))
+        ax.set_ylim(bottom=0)    
 
     
     def plotPosError(self, condition, channel, mode='et', sigma=0):
