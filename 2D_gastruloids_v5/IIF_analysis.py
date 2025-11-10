@@ -33,16 +33,6 @@ def return_fates(data, thresh=1):
     NANOG_scaled = data['NANOG']/thresh['NANOG']
     SOX2_scaled = data['SOX2']/thresh['SOX2']
 
-    # PGCLC = TFAP2C & SOX17 
-    # endo = SOX17 & ~PGCLC
-    # meso = TBXT & TBX6 & ~PGCLC & ~endo
-    # AMLC = ISL1 & ~PGCLC & ~meso & ~endo
-    # PSLC = (TBXT_scaled > SOX2_scaled) & (data['TBXT'] > 100) & ~TBX6 & ~PGCLC & ~AMLC & ~endo
-    # pluri = NANOG & SOX2 & ~PGCLC & ~meso & ~PSLC & ~AMLC
-    # ecto = ~NANOG & (SOX2_scaled > TBXT_scaled) & (data['SOX2'] > 100) & ~PGCLC & ~meso & ~PSLC & ~AMLC & ~endo
-    # AMLC = (AMLC | TFAP2C) & ~(ecto | pluri | PSLC | meso | PGCLC | endo)
-    # other = ~(ecto | pluri | PSLC | AMLC | meso | PGCLC | endo)
-
     PGCLC = TFAP2C & SOX17 
     endo = SOX17 & ~PGCLC
     meso = TBXT & TBX6 & ~PGCLC & ~endo
@@ -77,16 +67,20 @@ def return_fates(data, thresh=1):
 
 class VIB:
 
-    def __init__(self, feat_train, tar_train):
+    def __init__(self, feat_train, tar_train, hyperparam=None):
 
-        # VIB model parameters (for signal input)
-        LATENT_DIM = 2
-        HIDDEN_DIM = 64
-        N_LAYERS = 2
-        EPOCHS = 800
-        LEARNING_RATE = 1e-3
-        BETA = 0.01
-
+        # VIB hyperparameters (for signal input)
+        defaults = {
+            'LATENT_DIM' : 2,
+            'HIDDEN_DIM' : 64,
+            'N_LAYERS' : 2,
+            'EPOCHS' : 800,
+            'LEARNING_RATE' : 1e-3,
+            'BETA' : 0.01
+        }
+        hyperparam = hyperparam or {} # if not provided make an empty dict
+        hyperparam = {**defaults, **hyperparam} # merge dictionaries second overrides first
+ 
         N_DIM_INPUT = feat_train.shape[1]
         N_DIM_OUTPUT = tar_train.shape[1]
 
@@ -107,9 +101,9 @@ class VIB:
         self.model = fns_NN.FlexibleVIB(
             input_dim=N_DIM_INPUT,
             output_dim=N_DIM_OUTPUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            n_layers=N_LAYERS,
+            latent_dim=hyperparam['LATENT_DIM'],
+            hidden_dim=hyperparam['HIDDEN_DIM'],
+            n_layers=hyperparam['N_LAYERS'],
             encoder_type='nonlinear',
             decoder_type='nonlinear'
         )
@@ -118,9 +112,9 @@ class VIB:
         _ = fns_NN.train_model(
             self.model, X_train_run, Y_train_run,
             is_vae=False,
-            epochs=EPOCHS,
-            lr=LEARNING_RATE,
-            beta=BETA,
+            epochs=hyperparam['EPOCHS'],
+            lr=hyperparam['LEARNING_RATE'],
+            beta=hyperparam['BETA'],
             verbose=False
         )
 
@@ -225,19 +219,32 @@ class Position:
         
         self.ID = posID
 
-    def scatter(self, channel, ms=1, vmin=0, vmax=3):
+    def scatter(self, channel, ms=1, vmin=None, vmax=None, ax=None, thresh=None):
         # make a scatter plot of the colony
         # 
         # channel: color channel 
         # ms : scatter point size
         # vmin, vmax : min and max color
+
+        if ax==None:
+            fig, ax = plt.subplots(1,1)
         
         color = self.cellData['intensities'][channel]
         order = color.sort_values().index;
+
+        if thresh!=None:
+            color = color > thresh
+        else:
+            if vmin is None:
+                vmin = np.percentile(color, 1)
+            if vmax is None:
+                vmax = np.percentile(color, 99)
         
-        plt.scatter(self.cellData['XY']['X'][order], self.cellData['XY']['Y'][order], s=ms, c=color[order], cmap='YlGnBu', vmin=vmin, vmax=vmax)
-        plt.axis('square');
-        plt.axis('off');
+        ax.scatter(self.cellData['XY']['X'][order], self.cellData['XY']['Y'][order], s=ms, c=color[order], cmap='YlGnBu', vmin=vmin, vmax=vmax)
+        ax.set_aspect('equal') 
+        ax.axis('off');
+
+        return (vmin, vmax)
 
     def scatter_fates(self, ms=10, legend=True, ax=None, thresh=1):
         
