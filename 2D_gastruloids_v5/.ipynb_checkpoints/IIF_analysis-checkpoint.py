@@ -5,6 +5,7 @@ import scipy.interpolate as interp
 from scipy.ndimage import gaussian_filter1d
 import sklearn
 import torch
+import torch.optim as optim
 
 import sys
 sys.path.append('/Users/idse/repos/signaldecoding/2D_gastruloids_v5')
@@ -36,13 +37,12 @@ def return_fates(data, thresh=1):
     PGCLC = TFAP2C & SOX17 
     endo = SOX17 & ~PGCLC
     meso = TBXT & TBX6 & ~PGCLC & ~endo
-    AMLC = ISL1 & ~PGCLC & ~meso & ~endo 
-    ecto = ~NANOG & (SOX2_scaled > TBXT_scaled) & (data['SOX2'] > 100) & ~PGCLC & ~meso & ~endo & ~AMLC 
+    AMLC = ISL1 & ~PGCLC & ~meso & ~endo  
+    ecto = ~NANOG & (SOX2_scaled > TBXT_scaled) & (data['SOX2'] > 100)  & ~PGCLC & ~meso & ~endo & ~AMLC 
     PSLC = (TBXT_scaled > NANOG_scaled) & TBXT & ~PGCLC & ~meso & ~endo & ~AMLC & ~ecto # (data['TBXT'] > 100)
     pluri = (NANOG_scaled > TBXT_scaled) & NANOG & SOX2 & ~PGCLC & ~meso & ~endo & ~AMLC & ~ecto & ~PSLC 
     AMLC = (AMLC | TFAP2C) & ~(ecto | pluri | PSLC | meso | PGCLC | endo)
     other = ~(ecto | pluri | PSLC | AMLC | meso | PGCLC | endo)
-
 
     # # OLD defs
     # PGCLC = TFAP2C & SOX17 
@@ -109,14 +109,71 @@ class VIB:
         )
         
         # Train
-        _ = fns_NN.train_model(
-            self.model, X_train_run, Y_train_run,
-            is_vae=False,
+        _ = self.train(
+            X_train_run, Y_train_run,
             epochs=hyperparam['EPOCHS'],
             lr=hyperparam['LEARNING_RATE'],
             beta=hyperparam['BETA'],
             verbose=False
         )
+
+    
+    # def train(self, X_data, Y_data, epochs=800, lr=1e-3, 
+    #             beta=1.0, verbose=False, print_every=200):
+    #     """
+    #     Train VIB model
+        
+    #     Parameters:
+    #     -----------
+    #     model : nn.Module
+    #         VAE or VIB model
+    #     X_data : torch.Tensor
+    #         Input data
+    #     Y_data : torch.Tensor
+    #         Output data (used for VIB, ignored for VAE)
+    #     is_vae : bool
+    #         If True, train as VAE (X->X), else train as VIB (X->Y)
+    #     epochs : int
+    #         Number of training epochs
+    #     lr : float
+    #         Learning rate
+    #     beta : float
+    #         Weight for KL divergence
+    #     verbose : bool
+    #         If True, print training progress
+    #     print_every : int
+    #         Print progress every N epochs
+            
+    #     Returns:
+    #     --------
+    #     recon_losses : list
+    #         List of reconstruction losses per epoch
+    #     """
+    #     optimizer = optim.Adam(self.model.parameters(), lr=lr)
+    #     recon_losses = []
+        
+    #     for epoch in range(epochs):
+    #         optimizer.zero_grad()
+            
+    #         recon, mu, logvar = self.model(X_data)
+    #         target = Y_data
+
+    #         # compute loss
+    #         recon_loss = torch.nn.MSELoss()(recon, target)
+    #         kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / target.size(0)
+    #         loss = recon_loss + beta*kl_loss
+            
+    #         loss.backward()
+    #         optimizer.step()
+            
+    #         recon_losses.append(recon_loss.item())
+            
+    #         if verbose and (epoch + 1) % print_every == 0:
+    #             print(f'  Epoch {epoch+1}/{epochs}, Loss: {loss.item():.4f}, '
+    #                   f'Recon: {recon_loss.item():.4f}, KL: {kl_loss.item():.4f}')
+        
+    #     return recon_losses
+    
 
     def predict(self, feat_test):
         
@@ -135,6 +192,51 @@ class VIB:
             target_predict = pd.DataFrame(target_predict, index=feat_test.index, columns=self.tar_train.columns)
     
         return target_predict
+
+    def train(self, X_train, Y_train, X_val, Y_val, epochs=800, lr=1e-3,
+              beta=1.0, patience=10, min_delta=1e-4, verbose=False, print_every=200):
+        optimizer = optim.Adam(self.model.parameters(), lr=lr)
+        train_losses = []
+        val_losses = []
+        best_val_loss = float('inf')
+        epochs_no_improve = 0
+    
+        for epoch in range(epochs):
+            # Training step
+            self.model.train()
+            optimizer.zero_grad()
+            recon, mu, logvar = self.model(X_train)
+            target = Y_train
+            loss, recon_loss, kl_loss = compute_loss(recon, target, mu, logvar, beta=beta)
+            loss.backward()
+            optimizer.step()
+            train_losses.append(recon_loss.item())
+    
+            # Validation step
+            self.model.eval()
+            with torch.no_grad():
+                recon_val, mu_val, logvar_val = self.model(X_val)
+                val_target = Y_val
+                _, val_recon_loss, _ = compute_loss(recon_val, val_target, mu_val, logvar_val, beta=beta)
+                val_losses.append(val_recon_loss.item())
+    
+            # Early stopping check
+            if val_recon_loss.item() < best_val_loss - min_delta:
+                best_val_loss = val_recon_loss.item()
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+    
+            if verbose and (epoch + 1) % print_every == 0:
+                print(f'Epoch {epoch+1}/{epochs}, Train Recon: {recon_loss.item():.4f}, '
+                      f'Val Recon: {val_recon_loss.item():.4f}, KL: {kl_loss.item():.4f}')
+    
+            if epochs_no_improve >= patience:
+                if verbose:
+                    print(f"Early stopping at epoch {epoch+1}. Best val recon loss: {best_val_loss:.4f}")
+                break
+    
+        return train_losses, val_losses
 
 
 # # convert data to David's format 
@@ -571,47 +673,55 @@ class MPexperiment(Experiment):
                 # conditionPosVars = [c.posError**2 for c in conditionCols];
                 # self.posErrorIntrinsic[cond] = pd.concat(conditionPosVars).groupby(level=0).mean().applymap(np.sqrt)
             
-    def plotRadialProfiles(self, channel, condition, mode='cells', sigma=0, color = 'blue', ax=None):
+    def plotRadialProfiles(self, channel, condition, mode='cells', sigma=0, color = 'blue', ax=None, normalize=False):
 
         r = self.radialGrids[condition];
-        # cut off the plots where there is no data
-        # actual bin radii may be off from true radius by dr so keeping some margin, also dr stored after Colony.calcRadialProfiles, clean up later
         dr = 10
         idx = r < self.trueRadiusMicron[condition] + dr 
-
+    
         if ax is None:
             _, ax = plt.subplots(1,1)
         
         if mode=='cells':
-
             y = self.radialProfilesTotal[condition][channel]
             yerr = self.radialProfilesTotal_std[condition][channel]
             if sigma>0:
                 y = gaussian_filter1d(y, sigma=sigma)
                 yerr = gaussian_filter1d(yerr, sigma=sigma)
-            ax.plot(r[idx], y[idx], color=color)
+            if normalize:
+                yerr = yerr/(max(y)-min(y))
+                y = y/(max(y)-min(y))
+            h, = ax.plot(r[idx], y[idx], color=color)
             ax.fill_between(r[idx], y[idx] - yerr[idx], y[idx] + yerr[idx], alpha=0.3, color=color, edgecolor='none')
         
         elif mode=='colonies':
-
             y = self.radialProfiles[condition][channel]
             yerr = self.radialProfiles_std[condition][channel]
-            ax.plot(r[idx], y[idx], color=color)
+            if normalize:
+                yerr = yerr/(max(y)-min(y))
+                y = (y-min(y))/(max(y)-min(y))
+                # yerr = yerr/max(y)
+                # y = y/max(y)
+            h, = ax.plot(r[idx], y[idx], color=color)
             ax.fill_between(r[idx], y[idx] - yerr[idx], y[idx] + yerr[idx], alpha=0.3, color=color, edgecolor='none')
+            # ADD THIS: return statement was missing for colonies mode
             
         elif mode=='colonies_individual':
-
             conditionCols = [c for c in self.positions.values() if c.condition==condition]
+            h = []  # Initialize as list
             for c in conditionCols:
-                ax.plot(r[idx], c.radialProfiles[channel][idx], color=color)
-                ax.legend([c.ID for c in conditionCols])
+                line, = ax.plot(r[idx], c.radialProfiles[channel][idx], color=color)
+                h.append(line)
+            ax.legend([c.ID for c in conditionCols])
+            return h  # Return list of handles for individual mode
         
         ax.set_box_aspect(1)
         ax.set_ylabel("intensity")
         ax.set_xlabel(r"edge distance ($\mu m$)")
         ax.set_xlim((0, self.radiusMicron[condition]))
         ax.set_ylim(bottom=0)    
-
+    
+        return h 
     
     def plotPosError(self, condition, channel, mode='et', sigma=0):
         # mode : string of first letters of errors to show: (e)xtrinsic, i(ntrinsic), t(otal)
