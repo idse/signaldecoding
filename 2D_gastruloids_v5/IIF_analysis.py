@@ -11,16 +11,25 @@ import sys
 sys.path.append('/Users/idse/repos/signaldecoding/2D_gastruloids_v5')
 import fns_plotting_scripts as fns_plot
 import fns_NN
-    
+
+colmap_fates = {'AMLC':[90/255,166/255,71/255,1],'PGCLC':[227/255,143/255,52/255,1],
+                 'PSLC':[211/255,62/255,43/255,1], 'meso':[140/255,40/255,93/255,1],
+                 'pluri':[75/255,167/255,158/255,1], 'ecto':[49/255,118/255,181/255,1], 
+                'endo':[227/255,179/255,61/255,1],'other':[0.8,0.8,0.8,1]}
+
 def return_fates(data, thresh=1):
     """
     define fates based on fate marker expression
     """
-    
-    fate_names = ['AMLC','PGCLC','PSLC','meso','pluri','ecto', 'endo', 'other']
+
+    fate_names = ['AMLC','PGCLC','ecto','pluri','meso','PSLC','other'] # 'endo', 
+    #fate_names = 
 
     if thresh==1:
         thresh = {'TFAP2C':1, 'SOX17':1, 'NANOG':1, 'ISL1':1, 'TBXT':1, 'TBX6':1, 'SOX2':1}
+        SOX2_bg = 0.1
+    else:
+        SOX2_bg = 100
     
     TFAP2C = data['TFAP2C'] > thresh['TFAP2C']
     SOX17 = data['SOX17'] > thresh['SOX17']
@@ -35,28 +44,28 @@ def return_fates(data, thresh=1):
     SOX2_scaled = data['SOX2']/thresh['SOX2']
 
     PGCLC = TFAP2C & SOX17 
-    endo = SOX17 & ~PGCLC
-    meso = TBXT & TBX6 & ~PGCLC & ~endo
-    AMLC = ISL1 & ~PGCLC & ~meso & ~endo  
-    ecto = ~NANOG & (SOX2_scaled > TBXT_scaled) & (data['SOX2'] > 100)  & ~PGCLC & ~meso & ~endo & ~AMLC 
-    PSLC = (TBXT_scaled > NANOG_scaled) & TBXT & ~PGCLC & ~meso & ~endo & ~AMLC & ~ecto # (data['TBXT'] > 100)
-    pluri = (NANOG_scaled > TBXT_scaled) & NANOG & SOX2 & ~PGCLC & ~meso & ~endo & ~AMLC & ~ecto & ~PSLC 
-    AMLC = (AMLC | TFAP2C) & ~(ecto | pluri | PSLC | meso | PGCLC | endo)
-    other = ~(ecto | pluri | PSLC | AMLC | meso | PGCLC | endo)
-
+    #endo = SOX17 & ~PGCLC
+    meso = TBXT & TBX6 & ~PGCLC #& ~endo
+    AMLC = ISL1 & ~PGCLC & ~meso # & ~endo  
+    PSLC = (TBXT_scaled > NANOG_scaled) & TBXT & ~PGCLC & ~meso & ~AMLC  #& ~endo # (data['TBXT'] > 100)
+    pluri = (NANOG_scaled > TBXT_scaled) & NANOG & SOX2 & ~PGCLC & ~meso & ~AMLC & ~PSLC  # & ~endo 
+    ecto = ~NANOG & (SOX2_scaled > TBXT_scaled) & (data['SOX2'] > SOX2_bg) & ~PGCLC & ~meso & ~AMLC &~pluri &~PSLC #  & ~endo 
+    AMLC = (AMLC | TFAP2C) & ~(ecto | pluri | PSLC | meso | PGCLC) # | endo
+    other = ~(ecto | pluri | PSLC | AMLC | meso | PGCLC) #  | endo
+    
     # # OLD defs
     # PGCLC = TFAP2C & SOX17 
-    # meso = TBXT & TBX6 & ~PGCLC
-    # AMLC = ISL1 & ~PGCLC & ~meso
-    # PSLC = TBXT & ~SOX2 & ~TBX6 & ~PGCLC & ~AMLC
+    # AMLC = ISL1 & ~PGCLC
+    # meso = TBXT & TBX6 & ~PGCLC & ~AMLC
+    # PSLC = TBXT & ~TBX6 & ~PGCLC & ~AMLC 
     # pluri = SOX2 & NANOG & ~PGCLC & ~meso & ~PSLC & ~AMLC
-    # ecto = ~NANOG & SOX2 & ~PGCLC & ~meso & ~PSLC & ~AMLC 
+    # ecto = SOX2 & ~NANOG & ~PGCLC & ~meso & ~PSLC & ~AMLC 
     # other = ~(ecto | pluri | PSLC | AMLC | meso | PGCLC)
 
     labels = np.empty(data.shape[0], dtype='<U5')  # or dtype=str
     labels[PGCLC] = "PGCLC"
     labels[meso] = "meso"
-    labels[endo] = "endo"
+    #labels[endo] = "endo"
     labels[AMLC] = "AMLC"
     labels[PSLC] = "PSLC"
     labels[pluri] = "pluri"
@@ -64,6 +73,126 @@ def return_fates(data, thresh=1):
     labels[other] = "other"
     
     return labels, fate_names
+
+def calcPerformance(data, pred_subs, thresh, gene_names):
+                    
+    performances = dict()
+
+    for cond in np.unique(data['condition']): 
+    
+        fates, fate_names = return_fates(data, thresh=thresh)
+        idx = (data['condition'] == cond) & (fates != 'other')
+        data_cond = data[idx]
+        
+        fates_cond, _ = return_fates(data_cond, thresh=thresh)
+        
+        # Dictionary to collect all data before creating DataFrame
+        all_data = {marker: {} for marker in gene_names + ['fate_macro'] + fate_names}
+        
+        for pred_sub_name, pred_sub in pred_subs.items():
+    
+            pred_sub = pred_sub['avg'][idx]
+            
+            # For collecting metrics across runs
+            acc_dict = {marker: [] for marker in gene_names + ['fate_macro'] + fate_names}
+            f1_dict  = {marker: [] for marker in gene_names + ['fate_macro'] + fate_names}
+            precision_dict  = {marker: [] for marker in gene_names + ['fate_macro'] + fate_names}
+            recall_dict  = {marker: [] for marker in gene_names + ['fate_macro'] + fate_names}
+
+            # random guessing comparison
+            f1_rand_dict = {marker: [] for marker in gene_names + ['fate_macro'] + fate_names}
+            
+            fates_pred, _ = return_fates(pred_sub, thresh=thresh)
+    
+            for colID in np.unique(data_cond['Colony']):
+    
+                colidx = data_cond['Colony']==colID
+
+                #---------------- fate scores -------------------
+                
+                f1 = sklearn.metrics.f1_score(fates_cond[colidx], fates_pred[colidx], average='macro', zero_division=0)
+                accuracy = sklearn.metrics.accuracy_score(fates_cond[colidx], fates_pred[colidx])
+                precision = sklearn.metrics.precision_score(fates_cond[colidx], fates_pred[colidx], average='macro', zero_division=0)
+                recall = sklearn.metrics.recall_score(fates_cond[colidx], fates_pred[colidx], average='macro', zero_division=0)
+                    
+                acc_dict['fate_macro'].append(accuracy)
+                f1_dict['fate_macro'].append(f1)
+                precision_dict['fate_macro'].append(precision)
+                recall_dict['fate_macro'].append(recall)
+
+                # macro average of f1 score for random guessing based on probability of fate is 1/n
+                n = len([fn for fn in fate_names if fn!='other'])
+                f1_rand_dict['fate_macro'].append(1/n)
+
+                f1 = sklearn.metrics.f1_score(fates_cond[colidx], fates_pred[colidx], average=None, labels=fate_names, zero_division=0)
+                precision = sklearn.metrics.precision_score(fates_cond[colidx], fates_pred[colidx], average=None, labels=fate_names, zero_division=0)
+                recall = sklearn.metrics.recall_score(fates_cond[colidx], fates_pred[colidx], average=None, labels=fate_names, zero_division=0)
+                
+                for i,f in enumerate(fate_names):
+                    if not np.isnan(f1[i]):
+                        f1_dict[f].append(f1[i])
+                        precision_dict[f].append(precision[i])
+                        recall_dict[f].append(recall[i])
+                        f1_rand_dict[f].append(np.sum(fates_cond[colidx]==f)/len(fates_cond[colidx]))
+
+                #---------------- marker scores -------------------
+                
+                for marker in gene_names:
+                        
+                    markerpos = data_cond[colidx][marker].to_numpy() > thresh[marker]
+                    markerpos_pred = pred_sub[colidx][marker].to_numpy() > thresh[marker] 
+        
+                    f1 = sklearn.metrics.f1_score(markerpos, markerpos_pred, average='binary', pos_label=1, zero_division=0)
+                    accuracy = sklearn.metrics.accuracy_score(markerpos, markerpos_pred)
+                    precision = sklearn.metrics.precision_score(markerpos, markerpos_pred, average='binary', pos_label=1, zero_division=0)
+                    recall = sklearn.metrics.recall_score(markerpos, markerpos_pred, average='binary', pos_label=1, zero_division=0)
+        
+                    # Populate dicts
+                    acc_dict[marker].append(accuracy)
+                    f1_dict[marker].append(f1)
+                    precision_dict[marker].append(precision)
+                    recall_dict[marker].append(recall)
+                    f1_rand_dict[marker].append(np.sum(markerpos)/len(markerpos))
+            
+            # Store all metrics for this pred_sub_name
+            # Use nanmean and nanstd to handle NaN values
+            fate_names = [f for f in fate_names if f != 'other']
+            
+            for k in gene_names + ['fate_macro'] + fate_names:
+
+                # there is no accuracy for individual fates, just an overall accuracy of the N-way classification
+                if k not in fate_names:
+                    all_data[k][f"{pred_sub_name}-acc-avg"] = np.nanmean(acc_dict[k])
+                    all_data[k][f"{pred_sub_name}-acc-std"] = np.nanstd(acc_dict[k])
+                all_data[k][f"{pred_sub_name}-f1-avg"] = np.nanmean(f1_dict[k])
+                all_data[k][f"{pred_sub_name}-f1-std"] = np.nanstd(f1_dict[k])
+                all_data[k][f"{pred_sub_name}-f1_rand-avg"] = np.nanmean(f1_rand_dict[k])
+                all_data[k][f"{pred_sub_name}-f1_rand-std"] = np.nanstd(f1_rand_dict[k])
+                all_data[k][f"{pred_sub_name}-precision-avg"] = np.nanmean(precision_dict[k])
+                all_data[k][f"{pred_sub_name}-precision-std"] = np.nanstd(precision_dict[k])
+                all_data[k][f"{pred_sub_name}-recall-avg"] = np.nanmean(recall_dict[k])
+                all_data[k][f"{pred_sub_name}-recall-std"] = np.nanstd(recall_dict[k])
+                
+        # Create DataFrame from all_data dictionary at once
+        performance = pd.DataFrame.from_dict(all_data, orient='index')
+    
+        # Add average row for gene_names only (excluding 'fate')            
+        avg_row = performance.loc[gene_names].mean()
+        performance.loc['marker_avg'] = avg_row
+        
+        # Reorder columns: all acc columns first, then all f1 columns, etc
+        acc_cols = [col for col in performance.columns if '-acc-' in col]
+        f1_cols = [col for col in performance.columns if '-f1-' in col]
+        precision_cols = [col for col in performance.columns if '-precision-' in col]
+        recall_cols = [col for col in performance.columns if '-recall-' in col]
+        f1_rand_cols = [col for col in performance.columns if '-f1_rand-' in col]
+        performance = performance[acc_cols + f1_cols + precision_cols + recall_cols + f1_rand_cols]
+    
+        performances[cond]=performance
+        
+    return performances, recall_dict
+    
+
 
 class VIB:
 
@@ -117,64 +246,6 @@ class VIB:
             verbose=False
         )
 
-    
-    # def train(self, X_data, Y_data, epochs=800, lr=1e-3, 
-    #             beta=1.0, verbose=False, print_every=200):
-    #     """
-    #     Train VIB model
-        
-    #     Parameters:
-    #     -----------
-    #     model : nn.Module
-    #         VAE or VIB model
-    #     X_data : torch.Tensor
-    #         Input data
-    #     Y_data : torch.Tensor
-    #         Output data (used for VIB, ignored for VAE)
-    #     is_vae : bool
-    #         If True, train as VAE (X->X), else train as VIB (X->Y)
-    #     epochs : int
-    #         Number of training epochs
-    #     lr : float
-    #         Learning rate
-    #     beta : float
-    #         Weight for KL divergence
-    #     verbose : bool
-    #         If True, print training progress
-    #     print_every : int
-    #         Print progress every N epochs
-            
-    #     Returns:
-    #     --------
-    #     recon_losses : list
-    #         List of reconstruction losses per epoch
-    #     """
-    #     optimizer = optim.Adam(self.model.parameters(), lr=lr)
-    #     recon_losses = []
-        
-    #     for epoch in range(epochs):
-    #         optimizer.zero_grad()
-            
-    #         recon, mu, logvar = self.model(X_data)
-    #         target = Y_data
-
-    #         # compute loss
-    #         recon_loss = torch.nn.MSELoss()(recon, target)
-    #         kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / target.size(0)
-    #         loss = recon_loss + beta*kl_loss
-            
-    #         loss.backward()
-    #         optimizer.step()
-            
-    #         recon_losses.append(recon_loss.item())
-            
-    #         if verbose and (epoch + 1) % print_every == 0:
-    #             print(f'  Epoch {epoch+1}/{epochs}, Loss: {loss.item():.4f}, '
-    #                   f'Recon: {recon_loss.item():.4f}, KL: {kl_loss.item():.4f}')
-        
-    #     return recon_losses
-    
-
     def predict(self, feat_test):
         
         feat_test_z = self.scaler_X_run.transform(feat_test)
@@ -193,99 +264,78 @@ class VIB:
     
         return target_predict
 
-    def train(self, X_train, Y_train, X_val, Y_val, epochs=800, lr=1e-3,
+    def train(self, X_train, Y_train, epochs=800, lr=1e-3, #X_val, Y_val, 
               beta=1.0, patience=10, min_delta=1e-4, verbose=False, print_every=200):
+        
         optimizer = optim.Adam(self.model.parameters(), lr=lr)
-        train_losses = []
-        val_losses = []
-        best_val_loss = float('inf')
-        epochs_no_improve = 0
+
+        recon_losses = []
     
         for epoch in range(epochs):
-            # Training step
-            self.model.train()
+            
             optimizer.zero_grad()
             recon, mu, logvar = self.model(X_train)
             target = Y_train
-            loss, recon_loss, kl_loss = compute_loss(recon, target, mu, logvar, beta=beta)
+            
+            recon_loss = torch.nn.MSELoss()(recon, target)
+            kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / target.size(0)
+            loss = recon_loss + beta * kl_loss
+
             loss.backward()
             optimizer.step()
-            train_losses.append(recon_loss.item())
-    
-            # Validation step
-            self.model.eval()
-            with torch.no_grad():
-                recon_val, mu_val, logvar_val = self.model(X_val)
-                val_target = Y_val
-                _, val_recon_loss, _ = compute_loss(recon_val, val_target, mu_val, logvar_val, beta=beta)
-                val_losses.append(val_recon_loss.item())
-    
-            # Early stopping check
-            if val_recon_loss.item() < best_val_loss - min_delta:
-                best_val_loss = val_recon_loss.item()
-                epochs_no_improve = 0
-            else:
-                epochs_no_improve += 1
-    
+            
+            recon_losses.append(recon_loss.item())
+            
             if verbose and (epoch + 1) % print_every == 0:
-                print(f'Epoch {epoch+1}/{epochs}, Train Recon: {recon_loss.item():.4f}, '
-                      f'Val Recon: {val_recon_loss.item():.4f}, KL: {kl_loss.item():.4f}')
+                print(f'  Epoch {epoch+1}/{epochs}, Loss: {loss.item():.4f}, '
+                      f'Recon: {recon_loss.item():.4f}, KL: {kl_loss.item():.4f}')
+        
+        return recon_losses
+        
+        # train_losses = []
+        # val_losses = []
+        # best_val_loss = float('inf')
+        # epochs_no_improve = 0
     
-            if epochs_no_improve >= patience:
-                if verbose:
-                    print(f"Early stopping at epoch {epoch+1}. Best val recon loss: {best_val_loss:.4f}")
-                break
+        # for epoch in range(epochs):
+            
+        #     # Training step
+        #     self.model.train()
+        #     optimizer.zero_grad()
+        #     recon, mu, logvar = self.model(X_train)
+            
+        #     target = Y_train
+        #     loss, recon_loss, kl_loss = compute_loss(recon, target, mu, logvar, beta=beta)
+        #     loss.backward()
+        #     optimizer.step()
+        #     train_losses.append(recon_loss.item())
     
-        return train_losses, val_losses
+        #     # Validation step
+        #     self.model.eval()
+        #     with torch.no_grad():
+        #         recon_val, mu_val, logvar_val = self.model(X_val)
+        #         val_target = Y_val
+        #         _, val_recon_loss, _ = compute_loss(recon_val, val_target, mu_val, logvar_val, beta=beta)
+        #         val_losses.append(val_recon_loss.item())
+    
+        #     # Early stopping check
+        #     if val_recon_loss.item() < best_val_loss - min_delta:
+        #         best_val_loss = val_recon_loss.item()
+        #         epochs_no_improve = 0
+        #     else:
+        #         epochs_no_improve += 1
+    
+        #     if verbose and (epoch + 1) % print_every == 0:
+        #         print(f'Epoch {epoch+1}/{epochs}, Train Recon: {recon_loss.item():.4f}, '
+        #               f'Val Recon: {val_recon_loss.item():.4f}, KL: {kl_loss.item():.4f}')
+    
+        #     if epochs_no_improve >= patience:
+        #         if verbose:
+        #             print(f"Early stopping at epoch {epoch+1}. Best val recon loss: {best_val_loss:.4f}")
+        #         break
+    
+        # return train_losses, val_losses
 
-
-# # convert data to David's format 
-# def data2david(data, features):
-
-#     # Step 1: Features and Colonies
-#     df = data[features + ['Colony']]
-#     features = [c for c in df.columns if c != 'Colony']
-#     colonies = sorted(df['Colony'].unique())
-#     n_colonies = len(colonies)
-#     n_features = len(features)
-
-#     # Step 2: Max cells per colony
-#     max_cells = df.groupby('Colony').size().max()
-
-#     # Initialize array: (colonies, cells, features)
-#     arr = np.full((n_colonies, max_cells, n_features), np.nan)
-    
-#     # Fill
-#     for i, colony_num in enumerate(colonies):
-#         colony_data = df[df['Colony'] == colony_num][features].values
-#         arr[i, :len(colony_data), :] = colony_data
-    
-#     return arr
-    
-# def test_train_split_colonies(feature, target, train_size=3):
-
-#     # Split test/train by colony
-#     N_sys = feature.shape[0]
-#     N_tar = target.shape[2]
-    
-#     test_size = N_sys - train_size
-    
-#     # Use first N=test_size colonies for testing, so colony 1 can be used for plotting
-#     feature_test = feature[:test_size, :, :]
-#     target_test = target[:test_size, :, :]
-    
-#     # Use last colonies for training
-#     feature_train = feature[-train_size:, :, :] 
-#     target_train = target[-train_size:, :, :]
-
-#     feat_train, tar_train, _ = fns_NN.clean_data(feature_train, target_train)
-#     feat_test, tar_test, _ = fns_NN.clean_data(feature_test, target_test)
-
-#     if N_tar == 1:
-#         tar_train = tar_train.ravel()
-#         tar_test = tar_test.ravel()
-    
-#     return (feat_train, feat_test, tar_train, tar_test)
 
 
 class Metadata: 
@@ -353,7 +403,7 @@ class Position:
         data = self.cellData['intensities'];
         marker_clusters, fate_names = return_fates(data, thresh)
         colors = fns_plot.return_colmaps('fates')
-
+                
         if ax==None:
             fig, ax = plt.subplots(1,1)
         
@@ -362,7 +412,7 @@ class Position:
             idx = marker_clusters==cl;
             X = self.cellData['XY']['X'][idx]
             Y = self.cellData['XY']['Y'][idx]
-            scatter = ax.scatter(X,Y,color=colors[i], s=ms, edgecolors='none');
+            scatter = ax.scatter(X,Y,color=colmap_fates[cl], s=ms, edgecolors='none');
             
         if legend:
             ax.legend(fate_names)
