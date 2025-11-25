@@ -6,7 +6,9 @@ from scipy.ndimage import gaussian_filter1d
 import sklearn
 import torch
 import torch.optim as optim
-
+import os
+from skimage import io as imio
+from skimage import exposure
 import sys
 sys.path.append('/Users/idse/repos/signaldecoding/2D_gastruloids_v5')
 import fns_plotting_scripts as fns_plot
@@ -16,6 +18,129 @@ colmap_fates = {'AMLC':[90/255,166/255,71/255,1],'PGCLC':[227/255,143/255,52/255
                  'PSLC':[211/255,62/255,43/255,1], 'meso':[140/255,40/255,93/255,1],
                  'pluri':[75/255,167/255,158/255,1], 'ecto':[49/255,118/255,181/255,1], 
                 'endo':[227/255,179/255,61/255,1],'other':[0.8,0.8,0.8,1]}
+
+#------------------------------------------------------------------------------------------------------------
+# RAW DATA VISUALIZATION
+#------------------------------------------------------------------------------------------------------------
+
+def getStainSchemeFromDir(dataDir, rdStr='RD'):
+    # EXTRACT STAINING SCHEME FROM DIRECTORY NAMES
+    # 
+    # we assume the image data is stored in the a subdirectory for each round of staining
+    # with the name <PREFIX><rdStr><ROUNDNUMBER>_<STAIN1>_<STAIN2>_<STAIN3>
+    # where <PREFIX> is a fixed prefix (experiment name) and <STAINX> is the name of the stain (both not containing _)
+    # <ROUNDNUMBER> is assumed to range over consecutive integers starting at 1
+    
+    # get the subdirs that contain the data for each round
+    stainDataDirs = [g for g in os.listdir(dataDir) if '_'+rdStr in g]
+    
+    # sort so order in list corresponds to round numbers
+    stainDataDirs.sort()
+    
+    # determine which element of the split directory name corresponds to the round number
+    rdidx = [i for i,j in enumerate(str.split(stainDataDirs[0],'_')) if j.startswith(rdStr)][0]; 
+    
+    # list of stains for each round
+    rd2stains = [str.split(g,'_')[rdidx+1:] for g in stainDataDirs];
+    
+    # make flat list of unique stains in experiment
+    allstains = []; 
+    for i in range(0,len(rd2stains)):
+        allstains = list(set(allstains + rd2stains[i]))
+    
+    # create dictionary to get rounds in which each stain occurs (can be multiple time)
+    stain2rd = {};
+    for s in allstains:
+        stain2rd[s] = [i+1 for i,j in enumerate(rd2stains) if s in j]
+
+    return stain2rd, rd2stains, stainDataDirs
+
+def getImageFilename(coli, stain, dataDir, rdStr='RD', imtype='MIP'):
+
+    stain2rd, rd2stains, stainDataDirs = getStainSchemeFromDir(dataDir, rdStr)
+    
+    # add _N for round N stain if stain was repeated, 
+    # defaults to first round in which a stain occurs
+    s = str.split(stain,'_');
+    stain = s[0];
+    if len(s)==1:
+        stainrep = 0;
+    else:
+        stainrep = int(s[1])-1;
+    
+    if stain.startswith('DAPI') :
+        ci = 0;
+        if len(s)==2:
+            rd = stainrep + 1;
+        else:
+            rd = 1;
+    else:
+        rd = stain2rd[stain][stainrep] - 1;
+        ci = rd2stains[rd].index(s[0]) + 1;
+        
+    if imtype == 'MIP':    
+        
+        base_dir = os.path.join(dataDir, stainDataDirs[rd], 'MIP')
+        file_base = 'stitched_MIP_p{0}_w{1}_t0000'
+        # Colony numbers start from 1 but filenames start from 0 (col 1 = p0000)
+        fname_base = file_base.format('%.4d' % (coli-1), '%.4d' % ci)
+        filepath_tif = os.path.join(base_dir, fname_base + '.tif')
+        filepath_jpg = os.path.join(base_dir, fname_base + '.jpg')
+    
+        # Check if .tif file exists
+        if os.path.exists(filepath_tif):
+            fname = filepath_tif
+        elif os.path.exists(filepath_jpg):
+            fname = filepath_jpg
+        else:
+            filepath = None  # Or raise an error, or handle as needed
+            raise FileNotFoundError("File " + filepath_jpg + " or .tif does not exist")
+
+    elif imtype == 'segOverlay':
+
+        # CHECK THAT THIS IS THE RIGHT FORMAT
+        filepath = os.path.join(dataDir, stainDataDirs[rd], 'MIP', 'aligned_segoverlay_p{0}.tif');
+        fname = filepath.format('%.4d' % (coli-1));
+        
+    else:
+        print('imtype not recognized, should be MIP or segOverlay')
+        
+    return fname
+
+def adjust_contrast(im, tol):
+    Imin, Imax = np.percentile(im[im>0], tol)
+    im_rescale = exposure.rescale_intensity(im, in_range=(Imin,Imax),out_range=(0,255))
+    return(im_rescale)
+
+def makeRGBoverlay(coli, markers, dataDir, rdStr='RD', Ilim=None):
+    
+    MIPca = {}
+
+    for i, m in zip(range(0,len(markers)), markers):
+
+        fname = getImageFilename(coli, m, dataDir, rdStr) 
+        print('loading', fname)
+        MIP = imio.imread(fname)
+        if Ilim==None:
+            Imin, Imax = np.percentile(MIP[MIP>0], tol[m])
+        else:
+            Imin, Imax = Ilim[m]        
+        MIPca[m] = exposure.rescale_intensity(MIP, in_range=(Imin,Imax),out_range=(0,255))
+
+    
+    if len(markers)==3:
+        RGBoverlay = np.stack([MIPca[markers[0]], MIPca[markers[1]], MIPca[markers[2]]], axis = 2)
+    elif len(markers)==2:
+        RGBoverlay = np.stack([MIPca[markers[0]], MIPca[markers[1]], 0*MIPca[markers[0]]], axis = 2)
+    else: 
+        RGBoverlay = MIPca[markers[0]];
+        
+    RGBoverlay=RGBoverlay.astype(np.uint8)
+        
+    return RGBoverlay
+    
+
+#------------------------------------------------------------------------------------------------------------
 
 def return_fates(data, thresh=1):
     """
