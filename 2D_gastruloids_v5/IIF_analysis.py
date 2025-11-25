@@ -371,7 +371,7 @@ class Position:
         
         self.ID = posID
 
-    def scatter(self, channel, ms=1, vmin=None, vmax=None, ax=None, thresh=None):
+    def scatter(self, channel, ms=1, vmin=None, vmax=None, ax=None, thresh=None, cmap='YlGnBu', tol=(1,99)):
         # make a scatter plot of the colony
         # 
         # channel: color channel 
@@ -388,32 +388,40 @@ class Position:
             color = color > thresh
         else:
             if vmin is None:
-                vmin = np.percentile(color, 1)
+                vmin = np.percentile(color, tol[0])
             if vmax is None:
-                vmax = np.percentile(color, 99)
+                vmax = np.percentile(color, tol[1])
+
+        X = (self.cellData['XY']['X'] - self.center[0])*self.resolution
+        Y = (self.cellData['XY']['Y'] - self.center[1])*self.resolution
         
-        ax.scatter(self.cellData['XY']['X'][order], self.cellData['XY']['Y'][order], s=ms, c=color[order], cmap='YlGnBu', vmin=vmin, vmax=vmax)
+        ax.scatter(X[order], Y[order], s=ms, c=color[order], cmap=cmap, vmin=vmin, vmax=vmax ,edgecolors='none')
         ax.set_aspect('equal') 
         ax.axis('off');
 
         return (vmin, vmax)
 
-    def scatter_fates(self, ms=10, legend=True, ax=None, thresh=1):
+    def scatter_fates(self, ms=1, legend=True, ax=None, thresh=1, fate='all'):
         
         data = self.cellData['intensities'];
-        marker_clusters, fate_names = return_fates(data, thresh)
+        fates, fate_names = return_fates(data, thresh)
         colors = fns_plot.return_colmaps('fates')
-                
+
+        X = (self.cellData['XY']['X'] - self.center[0])*self.resolution
+        Y = (self.cellData['XY']['Y'] - self.center[1])*self.resolution
+        
         if ax==None:
             fig, ax = plt.subplots(1,1)
         
-        for i, cl in enumerate(fate_names):
+        for i, f in enumerate(fate_names):
 
-            idx = marker_clusters==cl;
-            X = self.cellData['XY']['X'][idx]
-            Y = self.cellData['XY']['Y'][idx]
-            scatter = ax.scatter(X,Y,color=colmap_fates[cl], s=ms, edgecolors='none');
+            idx = fates == f;
             
+            if (fate == 'all') or (fate == f):
+                scatter = ax.scatter(X[idx], Y[idx], color=colmap_fates[f], s=ms, edgecolors='none');
+            else:
+                scatter = ax.scatter(X[idx], Y[idx], color='lightgray', s=ms, edgecolors='none');
+                
         if legend:
             ax.legend(fate_names)
         ax.set_aspect('equal') 
@@ -426,10 +434,11 @@ class Colony(Position):
 
         super().__init__(data, posID, meta, features)
 
+        self.resolution = meta.xres
         self.radiusMicron = nominalRadius
         self.radiusPixel = nominalRadius/meta.xres
         
-        self.center = data[['X','Y']].mean() # could further clean up by excluding cells outside the colony as in matlab
+        self.center = np.array(data[['X','Y']].mean()) # could further clean up by excluding cells outside the colony as in matlab
         radialOffset = 0 # np.mean(np.sqrt(data[data['MetricDist'] == 0].nucArea/np.pi))*meta.xres # optional if we want to compensate for the fact that the true edge is the mean nuclear location of the nuclei on the edge
         self.cellData['XY'] = self.cellData['XY'].assign(edgeDist=data['CircleEdgeDist'] + radialOffset)
         self.trueRadiusMicron = data['RadialDist'].iloc[0] + data['CircleEdgeDist'].iloc[0] + radialOffset # the true radius is not explicitly saved here but can be recovered like this
