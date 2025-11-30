@@ -139,6 +139,32 @@ def makeRGBoverlay(coli, markers, dataDir, rdStr='RD', Ilim=None):
         
     return RGBoverlay
     
+#------------------------------------------------------------------------------------------------------------
+# COMPATIBILTIY
+#------------------------------------------------------------------------------------------------------------
+
+# convert data to David's format 
+def data2david(data, features):
+
+    # Step 1: Features and Colonies
+    df = data[features + ['Colony']]
+    features = [c for c in df.columns if c != 'Colony']
+    colonies = sorted(df['Colony'].unique())
+    n_colonies = len(colonies)
+    n_features = len(features)
+
+    # Step 2: Max cells per colony
+    max_cells = df.groupby('Colony').size().max()
+
+    # Initialize array: (colonies, cells, features)
+    arr = np.full((n_colonies, max_cells, n_features), np.nan)
+    
+    # Fill
+    for i, colony_num in enumerate(colonies):
+        colony_data = df[df['Colony'] == colony_num][features].values
+        arr[i, :len(colony_data), :] = colony_data
+
+    return arr
 
 #------------------------------------------------------------------------------------------------------------
 # ANALYSIS
