@@ -6,6 +6,9 @@ Contains VAE and VIB models with flexible architectures
 """
 
 import torch
+device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+#print("Using device:", device)
+
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np

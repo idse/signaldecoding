@@ -4,8 +4,12 @@ import matplotlib.pyplot as plt
 import scipy.interpolate as interp
 from scipy.ndimage import gaussian_filter1d
 import sklearn
+
 import torch
+device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+#print("Using device:", device)
 import torch.optim as optim
+
 import os
 from skimage import io as imio
 from skimage import exposure
@@ -376,8 +380,8 @@ class VIB:
         tar_train_z = self.scaler_Y_run.fit_transform(tar_train)
         
         # Convert to torch
-        X_train_run = torch.FloatTensor(feat_train_z)
-        Y_train_run = torch.FloatTensor(tar_train_z)
+        X_train_run = torch.FloatTensor(feat_train_z).to(device)
+        Y_train_run = torch.FloatTensor(tar_train_z).to(device)
         
         # Create new VIB model (fresh random initialization each run)
         self.model = fns_NN.FlexibleVIB(
@@ -388,7 +392,7 @@ class VIB:
             n_layers=hyperparam['N_LAYERS'],
             encoder_type='nonlinear',
             decoder_type='nonlinear'
-        )
+        ).to(device)
         
         # Train
         _ = self.train(
@@ -402,11 +406,11 @@ class VIB:
     def predict(self, feat_test):
         
         feat_test_z = self.scaler_X_run.transform(feat_test)
-        X_test_run = torch.FloatTensor(feat_test_z)
+        X_test_run = torch.FloatTensor(feat_test_z).to(device)
 
         self.model.eval()
         with torch.no_grad():
-            target_predict_z = self.model(X_test_run)[0].numpy()
+            target_predict_z = self.model(X_test_run)[0].cpu().numpy()
 
         # Inverse transform
         target_predict = self.scaler_Y_run.inverse_transform(target_predict_z)
