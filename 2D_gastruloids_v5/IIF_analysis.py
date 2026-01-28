@@ -967,52 +967,6 @@ class VIB:
                       f'Recon: {recon_loss.item():.4f}, KL: {kl_loss.item():.4f}')
         
         return recon_losses
-        
-        # train_losses = []
-        # val_losses = []
-        # best_val_loss = float('inf')
-        # epochs_no_improve = 0
-    
-        # for epoch in range(epochs):
-            
-        #     # Training step
-        #     self.model.train()
-        #     optimizer.zero_grad()
-        #     recon, mu, logvar = self.model(X_train)
-            
-        #     target = Y_train
-        #     loss, recon_loss, kl_loss = compute_loss(recon, target, mu, logvar, beta=beta)
-        #     loss.backward()
-        #     optimizer.step()
-        #     train_losses.append(recon_loss.item())
-    
-        #     # Validation step
-        #     self.model.eval()
-        #     with torch.no_grad():
-        #         recon_val, mu_val, logvar_val = self.model(X_val)
-        #         val_target = Y_val
-        #         _, val_recon_loss, _ = compute_loss(recon_val, val_target, mu_val, logvar_val, beta=beta)
-        #         val_losses.append(val_recon_loss.item())
-    
-        #     # Early stopping check
-        #     if val_recon_loss.item() < best_val_loss - min_delta:
-        #         best_val_loss = val_recon_loss.item()
-        #         epochs_no_improve = 0
-        #     else:
-        #         epochs_no_improve += 1
-    
-        #     if verbose and (epoch + 1) % print_every == 0:
-        #         print(f'Epoch {epoch+1}/{epochs}, Train Recon: {recon_loss.item():.4f}, '
-        #               f'Val Recon: {val_recon_loss.item():.4f}, KL: {kl_loss.item():.4f}')
-    
-        #     if epochs_no_improve >= patience:
-        #         if verbose:
-        #             print(f"Early stopping at epoch {epoch+1}. Best val recon loss: {best_val_loss:.4f}")
-        #         break
-    
-        # return train_losses, val_losses
-
-
 
 class Metadata: 
 
