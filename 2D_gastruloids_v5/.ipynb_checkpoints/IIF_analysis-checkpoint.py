@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import scipy as sp
 import scipy.interpolate as interp
 from scipy.ndimage import gaussian_filter1d
 import sklearn
@@ -17,6 +18,11 @@ import sys
 sys.path.append('/Users/idse/repos/signaldecoding/2D_gastruloids_v5')
 import fns_plotting_scripts as fns_plot
 import fns_NN
+
+from scipy.stats import ttest_rel
+import statsmodels.stats
+import statsmodels.stats.multitest
+import time
 
 colmap_fates = {'AMLC':[90/255,166/255,71/255,1],'PGCLC':[227/255,143/255,52/255,1],
                  'PSLC':[211/255,62/255,43/255,1], 'meso':[140/255,40/255,93/255,1],
@@ -170,8 +176,482 @@ def data2david(data, features):
 
     return arr
 
+import matplotlib.patheffects as pe
+from matplotlib.patches import Arc
+
 #------------------------------------------------------------------------------------------------------------
-# ANALYSIS
+# ANALYSIS: INFORMATION
+#------------------------------------------------------------------------------------------------------------
+
+def getPreds(data, cond, dataDir, signal_chains, fatemarker, gene_names, hyperparam, N_run, save=True):
+
+    mean_preds = {}
+    mean_train_preds = {} # predictions on training data to check for overfitting
+
+    data_cond = data[data['condition']==cond]
+    
+    for feat_names in signal_chains:
+
+        feat_name_str = '_'.join(sorted(feat_names, key=str.lower))
+        fname = dataDir + '/251115_VIB_' + str(len(feat_names)) + 'D_'+cond+'_' + feat_name_str + '_avg.csv'
+        fname_train = dataDir + '/251115_VIB_' + str(len(feat_names)) + 'D_'+cond+'_' + feat_name_str + '_train_avg.csv'
+        
+        print(fname)
+        if os.path.exists(fname) and os.path.exists(fname_train):
+            #print('reading:'+fname)
+            mean_preds[tuple(feat_names)] = pd.read_csv(fname, index_col=0)
+            mean_train_preds[tuple(feat_names)] = pd.read_csv(fname_train, index_col=0)
+        else:
+            print('running: '+str(feat_names))
+            mean_preds[tuple(feat_names)], mean_train_preds[tuple(feat_names)] = sig2fate(data_cond, list(feat_names),  gene_names, N_run, hyperparam)
+            if save:
+                mean_preds[tuple(feat_names)].to_csv(fname)
+                mean_train_preds[tuple(feat_names)].to_csv(fname_train)
+
+    return mean_preds, mean_train_preds
+
+def col_meanstd(MI_dec):
+
+    genelist = list(MI_dec.keys())
+    signals = MI_dec[genelist[0]].index
+    colonies = MI_dec[genelist[0]].columns
+
+    # Initialize output DataFrames with signals as rows, genes as columns
+    MI_dec_mean = pd.DataFrame(np.zeros((len(signals), len(genelist))), index=signals, columns=genelist)
+    MI_dec_std = pd.DataFrame(np.zeros((len(signals), len(genelist))), index=signals, columns=genelist)
+
+    # Calculate mean and std across colonies for each gene
+    for gene in genelist:
+        MI_dec_mean[gene] = MI_dec[gene].mean(axis=1)  # Mean across colonies
+        MI_dec_std[gene] = MI_dec[gene].std(axis=1, ddof=1)  # Std across colonies
+
+    return MI_dec_mean, MI_dec_std
+    
+def plotCumulativeMI(data, cond, dataDir, markergenes, signals, signames_simple, N_run, hyperparam, plotparam=None, uniqueMI=None, checkoverfit=False, title=True):
+
+    # signals must be subset of global signal_names
+    # also get the simplified names corresponding to this subset
+    # index = [signal_names.index(item) for item in signals]
+    # if not signames_simple: signames_simple = [signal_names_simplified[i] for i in index]
+
+    if not plotparam: plotparam = {'fs':15, 'fs2':19, 'fs3':15, 'xlabel': 'cumulative MI (bits)','labelpad':-10, 'x':0.46,'round':2, 'marg':0.01}
+    
+    for fatemarker in markergenes:
+
+        print('=========='+fatemarker+'====================')
+        
+        data_cond = data[data['condition']==cond]
+        maxMI_dict = {0: {fatemarker:((), 0)}}
+        remaining_sigs = signals
+        MI_dec = {}
+        rd = 1
+    
+        while len(remaining_sigs) > 0:
+        
+            print('rd: '+str(rd))
+            signal_chains = [maxMI_dict[rd-1][fatemarker][0] + (s,) for s in remaining_sigs]
+
+            mean_preds, mean_train_preds = getPreds(data, cond, dataDir, signal_chains, fatemarker, markergenes, hyperparam, N_run)
+            if checkoverfit:
+                maxMI_dict[rd], MI_dec[rd] = getmaxDecoderMI([fatemarker], signals, mean_train_preds, data_cond, debug=False)
+            else:
+                maxMI_dict[rd], MI_dec[rd] = getmaxDecoderMI([fatemarker], signals, mean_preds, data_cond, debug=False)
+                
+            maxMIsigs = maxMI_dict[rd][fatemarker][0]
+            remaining_sigs = [s for s in signals if s not in list(maxMIsigs)]
+            rd += 1
+    
+        # MAKE THE PLOT
+        #------------------------------------------------------------------------------------------------
+
+        N_signals = len(signals)
+        signals_ordered = list(maxMI_dict[N_signals][fatemarker][0])
+        perm = [signals.index(item) for item in signals_ordered]
+        labels = [signames_simple[i] for i in perm]
+        
+        fig,ax = plt.subplots(1,1, figsize=(4,4.4))
+        
+        if title:
+            plt.title(fatemarker,fontsize=26, pad=10, fontweight='bold',color = [0, 0.8, 0.8], path_effects=[pe.withStroke(linewidth=1, foreground="black")])
+        maxMItotal = 0
+        xlim = 0
+        #color = 'cornflowerblue'
+        color = [0.6,0.6,0.6]
+        uniquecolor = [0.8,0.8,0.8]
+        kcutoff = 10
+
+        # find the signaling combination for which the MI is maximal
+        meanMI = [float(maxMI_dict[i][fatemarker][1].mean()) for i in range(1,len(maxMI_dict))]
+        maxMIidx = meanMI.index(max(meanMI)) + 1 # offset because list above starts at 1 
+        maxMIall = maxMI_dict[maxMIidx][fatemarker][1]
+
+        # MI for all signals combined
+        #maxMIall = maxMI_dict[N_signals][fatemarker][1]
+    
+        for k, s in enumerate(signals_ordered):
+        
+            MI_mean, MI_std = col_meanstd(MI_dec[1])
+            w = MI_mean.loc[s, fatemarker].iloc[0]
+            if uniqueMI:
+                u = uniqueMI[fatemarker][s]
+            else:
+                u = 0
+            std = MI_std.loc[s, fatemarker].iloc[0]/np.sqrt(5)
+            y = k+1
+    
+            # test if total MI is still significantly different from total
+            maxMIthisrd = maxMI_dict[k+1][fatemarker][1]
+            t_stat, p_value = sp.stats.ttest_rel(maxMIthisrd, maxMIall, alternative='two-sided')
+            print('p value ' + str(p_value))
+            if p_value > 0.05:
+                kcutoff = min(kcutoff, k+1)
+                
+            maxMIthisrdavg = np.mean(maxMI_dict[k+1][fatemarker][1])
+            maxMIthisrdstd = np.std(maxMI_dict[k+1][fatemarker][1])
+            sem = maxMIthisrdstd/np.sqrt(5)
+            maxMItotal = max(maxMIthisrdavg, maxMItotal)
+            
+            if k>0:
+                left = maxMIthisrdavg - w
+                ax.barh(y=y,width=w-u,left=left,color=color) 
+                ax.barh(y=y,width=u,left=left+w-u,color=uniquecolor) 
+                ax.errorbar(left+w,y,xerr=sem,capsize=3,color='k')
+                ax.text(left - plotparam['marg'], y, labels[k], va='center', ha='right', fontsize=plotparam['fs3'])
+                #ax.text(left + marg, y, labels[k], va='center', ha='left', fontsize=fs, path_effects=[pe.withStroke(linewidth=3, foreground="white")])
+            else:
+                ax.barh(y=y, width=w-u, color=color)
+                ax.barh(y=y,width=u,left=w-u,color=uniquecolor) 
+                ax.errorbar(w,y,xerr=sem,capsize=3,color='k')
+                ax.text(float(plotparam['marg']), y, labels[k], va='center', ha='left', fontsize=plotparam['fs3'], path_effects=[pe.withStroke(linewidth=5, foreground="white")])
+        
+        ax.set_yticks([])
+    
+        totalmean = np.mean(maxMIall)
+        totalsem = np.std(maxMIall)/np.sqrt(5)
+        xlim = totalmean*1.1 
+        
+        ax.axhline(y=kcutoff + 0.5, xmin=0, xmax=1, color='k', linestyle=':', linewidth=2, zorder=10)
+        ax.axvspan(xmin=totalmean-totalsem, xmax=totalmean+totalsem, color='k', alpha=0.1, zorder=0)
+        ax.axvline(x=np.mean(maxMIall), ymin=0, ymax=k+1, color='k', linestyle='-', linewidth=1, zorder=0, alpha=0.5)
+        
+        #ax.set_yticks(range(1,1+N_signals),labels=labels)
+        plt.xlim([0,xlim])
+        plt.ylim([1/4, N_signals+3/4])
+        plt.xticks([0,np.round(np.mean(maxMIall),plotparam['round'])],labels=['0',str(np.round(np.mean(maxMIall),plotparam['round']))], fontsize=plotparam['fs'])
+        ax.set_xlabel(plotparam['xlabel'], fontsize=plotparam['fs2'], labelpad=plotparam['labelpad'], x=plotparam['x'])
+        
+        for spine in ax.spines.values():
+            spine.set_linewidth(2)
+        
+        ax.set_box_aspect(1) #ax.set_aspect('equal', adjustable='box')
+        plt.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.15) 
+        #plt.tight_layout()
+        
+        #plt.tight_layout(pad=0)
+        
+        if checkoverfit:
+            fname = dataDir + '/cumulativeMI_' + fatemarker + '_' + cond + '_' + str(len(signals)) + 'D' + '_train.png'
+        else:
+            fname = dataDir + '/cumulativeMI_' + fatemarker + '_' + cond + '_' + str(len(signals)) + 'D' + '.png'
+        plt.savefig(fname)
+        
+def getmaxDecoderMI(genelist, signal_names, pred, data, debug=False):
+    # for genes in genelist, return the signal or signaling combination (keys in pred) that provides the highest decoder-based MI
+    # 
+    # list: list of marker gene names
+    # pred: dictionary: keys are tuples of signals, values are predictions of fate markers based on the signals 
+    
+    colonies = [int(n) for n in np.unique(data['Colony'])]
+    MI_dec = {} 
+    MI_dec_mean = pd.DataFrame(np.zeros((len(pred.keys()),len(genelist))), index=pred.keys(), columns=genelist)
+    maxMI_signal_for_gene = {}
+
+    for f in genelist:
+
+        # calculate MI for each combination of signals in pred
+        #-----------------------------------------------------
+        MI_dec[f] = pd.DataFrame(np.zeros((len(pred.keys()),len(colonies))), index=pred.keys(), columns=colonies)
+
+        for ci in colonies:
+            idx = data['Colony']==ci
+
+            for s in pred.keys():
+                MI_dec[f].at[s,ci] = sklearn.feature_selection.mutual_info_regression(pred[s].loc[idx,f].to_numpy().reshape(-1, 1), data.loc[idx,f].to_numpy())/np.log(2)
+
+        MI_dec_mean[f] = MI_dec[f].mean(axis=1)  # Mean across colonies (columns)
+        if debug: print(MI_dec_mean)
+
+        # test for significant differences in MI
+        #------------------------------------------------
+
+        # significance threshold 
+        alpha = 0.1
+        
+        best_idx = MI_dec_mean[f].idxmax()
+        best_mi = MI_dec[f].loc[best_idx]
+        print(f'best mean: {best_idx}, {MI_dec[f].loc[best_idx].mean():.2f}({MI_dec[f].loc[best_idx].std():.2f})')
+        
+        p_values = []
+        rejected = []
+        for s in MI_dec_mean.index:
+            if s != best_idx:
+                current_mi = MI_dec[f].loc[s]
+                
+                # Check if data is valid (not identical, not NaN)
+                if not current_mi.equals(best_mi) and len(current_mi) > 1:
+                    # paired ttest: MIs for each colony for different signals
+                    _, p = sp.stats.ttest_rel(best_mi, current_mi) 
+                    p_values.append((s, p))
+                    if debug: print(f'{s}, {current_mi.mean():.2f}({current_mi.std():.2f}), p:{p:.3f}')
+
+        if p_values:  # Only if there are comparisons to make
+            # Apply multiple testing correction
+            indices, pvals = zip(*p_values)
+            rejected, corrected_p, _, _ = statsmodels.stats.multitest.multipletests(pvals, alpha=alpha, method='fdr_bh') # , method='fdr_bh'
+            if debug: print(corrected_p)
+
+        # Check if best is significantly better than all others
+        if all(rejected):  # All comparisons significant
+            selected = best_idx
+            maxMI_signal_for_gene[f] = (best_idx, MI_dec[f].loc[best_idx])
+            print(f'selected best: {best_idx}, {MI_dec[f].loc[best_idx].mean():.2f}({MI_dec[f].loc[best_idx].std():.2f})')
+        else:
+            # Identify which variables are NOT significantly different from best
+            equivalent_vars = [best_idx] + [indices[i] for i, rej in enumerate(rejected) if not rej]
+
+            def get_sort_key(signal_tuple):
+                # Make sure it's a tuple
+                if not isinstance(signal_tuple, tuple):
+                    signal_tuple = (signal_tuple,)
+                
+                # For each signal in the tuple, get its position in default_order
+                # Signals not in default_order go to the end
+                priorities = []
+                for signal in signal_tuple:
+                    priorities.append(signal_names.index(signal))
+                return priorities
+            
+            # Sort and take the first one
+            equivalent_vars_sorted = sorted(equivalent_vars, key=get_sort_key)
+            print('selected best: '+str(equivalent_vars_sorted))
+            
+            #maxMI_signal_for_gene[f] = (equivalent_vars_sorted[0], MI_dec_mean.loc[equivalent_vars_sorted[0]].iloc[0])
+            maxMI_signal_for_gene[f] = (equivalent_vars_sorted[0], MI_dec[f].loc[equivalent_vars_sorted[0]])
+
+    # maxMI signal for gene is array with values for each colony
+    return maxMI_signal_for_gene, MI_dec
+
+
+def plotRedundantMI(dataDir, data, cond, markergenes, signals, N_run, hyperparam):
+
+    maxMI = {}
+    sumMI = {}
+    
+    for fatemarker in markergenes:
+
+        print('=========='+fatemarker+'====================')
+        
+        data_cond = data[data['condition']==cond]
+        maxMI_dict = {0: {fatemarker:((), 0)}}
+        remaining_sigs = signals
+        MI_dec = {}
+        rd = 1
+    
+        while len(remaining_sigs) > 0:
+        
+            print('rd: '+str(rd))
+            signal_chains = [maxMI_dict[rd-1][fatemarker][0] + (s,) for s in remaining_sigs]
+
+            mean_preds, mean_train_preds = getPreds(data, cond, dataDir, signal_chains, fatemarker, markergenes, hyperparam, N_run)
+            maxMI_dict[rd], MI_dec[rd] = getmaxDecoderMI([fatemarker], signals, mean_preds, data_cond, debug=False)
+            maxMIsigs = maxMI_dict[rd][fatemarker][0]
+            remaining_sigs = [s for s in signals if s not in list(maxMIsigs)]
+            rd += 1
+
+        maxMI[fatemarker] = max([MI_dec[i][fatemarker].mean(axis=1).max() for i in range(1,len(MI_dec))])
+        sumMI[fatemarker] = sum(MI_dec[1][fatemarker].mean(axis=1))
+
+    # MAKE THE PLOT
+    #------------------------------------------------------------------------------------------------
+    
+    labels = list(sumMI.keys())
+    fs = 18
+    ms = 10
+    
+    fig, ax = plt.subplots(figsize=(6, 0.3*len(labels) + 0.8))
+    xlim = 3
+    
+    for ct, fatemarker in enumerate(labels):
+    
+        ax.plot([sumMI[fatemarker], maxMI[fatemarker]], [ct, ct], color='k',zorder=1)
+        ax.scatter(sumMI[fatemarker],ct,color='blue',zorder=2)
+        ax.scatter(maxMI[fatemarker],ct,color='red',zorder=2)
+        print(fatemarker + ': ' + str(sumMI[fatemarker]) + ', ' + str(maxMI[fatemarker]))
+    
+    labels_tick = labels.copy()
+    ax.set_xticks([0,1,2,3])
+    ax.set_yticks(range(len(labels)), labels_tick)  # Set y-ticks to gene names
+    ax.tick_params(axis='both', labelsize=fs)
+    
+    ax.set_ylim([-0.5, len(labels) -0.5])
+    ax.set_xlim([0, xlim])
+    ax.set_xlabel('MI (bits)', fontsize=fs)
+    plt.gca().invert_yaxis()
+    plt.tight_layout()
+    
+    fname = dataDir + '/MI_redundancy_' + str(len(signals)) + 'D.png'
+    plt.savefig(fname)
+    
+    
+    fig, ax = plt.subplots(figsize=(6, 0.3*len(labels) + 0.8))
+    
+    meanratio = np.mean([maxMI[fatemarker]/sumMI[fatemarker] for fatemarker in labels])
+    print('mean ratio: ' + str(meanratio))
+    ax.axvline(x=meanratio, ymin=-0.5, ymax=len(labels) -0.5, color='k', linestyle='--', linewidth=1)
+    
+    for ct, fatemarker in enumerate(labels):
+        ax.scatter(maxMI[fatemarker]/sumMI[fatemarker],ct,color='k',zorder=2)
+        
+    labels_tick = labels.copy()
+    ax.set_xticks([0,1,2,3])
+    ax.set_yticks(range(len(labels)), labels_tick)  # Set y-ticks to gene names
+    ax.tick_params(axis='both', labelsize=fs)
+    
+    ax.set_ylim([-0.5, len(labels) -0.5])
+    ax.set_xlim([0, 1])
+    ax.set_xlabel('MI (bits)', fontsize=fs)
+    plt.gca().invert_yaxis()
+    plt.tight_layout()
+    
+    fname = dataDir + '/MI_redundancyratio_' + str(len(signals)) + 'D.png'
+    plt.savefig(fname)
+    #plt.legend()
+
+    
+def plotMIgraph(dataDir, data, cond, signames, markernames, signames_clean=None, markernames_clean=None, rotate=True, ax=None, fs=12, file_suffix='.png'):
+
+    if not signames_clean: signames_clean = signames
+    if not markernames_clean: markernames_clean = markernames
+    
+    data_cond = data[data['condition']==cond]
+    
+    N_signals = len(signames)
+    N_genes = len(markernames)
+    
+    #========================================
+    # calculate MI
+    #========================================
+    
+    # mutual information between signals
+    MIsigs = np.zeros((N_signals, N_signals))
+    for si in range(N_signals):
+        
+        MIsigs[si,si] = np.nan
+        
+        for sj in range(si+1, N_signals):
+            MIsigs[si,sj] = fns_plot.calc_MI_sklearn(data_cond[signames[si]].to_numpy(), data_cond[signames[sj]].to_numpy())
+            MIsigs[sj,si] = MIsigs[si,sj]
+    MIsigs = pd.DataFrame(MIsigs, index=signames, columns=signames)
+    
+    # mutual information between signals and fate markers
+    MI = np.zeros((N_signals, N_genes))
+    for si in range(N_signals):
+        for fj in range(N_genes):
+            MI[si,fj] = fns_plot.calc_MI_sklearn(data_cond[signames[si]].to_numpy(), data_cond[markernames[fj]].to_numpy())
+    MI = pd.DataFrame(MI, index=signames, columns=markernames)
+    
+    #========================================
+    # PLOT GRAPH
+    #========================================
+        
+    labels_top = signames.copy()
+    labels_top_clean = signames_clean.copy()
+    n = len(labels_top)
+    
+    labels_bottom = markernames.copy()
+    labels_bottom_clean = markernames_clean.copy()
+    m = len(labels_bottom) 
+    
+    if rotate:
+        labels_top.reverse()
+        labels_top_clean.reverse()
+        labels_bottom.reverse()
+        labels_bottom_clean.reverse()
+        offset = 0.2
+    else:
+        offset = 0.3
+    
+    conn = MI.loc[labels_top, labels_bottom]
+    sigs = data_cond[labels_top]
+    corr = sigs.corr().to_numpy()
+    allcorr = data_cond[labels_top + labels_bottom].corr()
+    
+    # ---- Plotting ----
+    if not ax:
+        fig, ax = plt.subplots(figsize=(4,3))
+        
+    ax.set_xlim(-1, max(n, m))
+    ax.set_ylim(-4, 2)
+    ax.axis('off')
+    
+    x_pos_top = np.linspace(0, max(n, m)-1, n)
+    x_pos_bot = np.linspace(0, max(n, m)-1, m)
+    y_top = 0
+    y_bot = -3
+    
+    # Draw top-layer nodes
+    for i, label in enumerate(labels_top_clean):
+        if rotate:
+            ax.text(x_pos_top[i], y_top-offset, label, ha='center', va='top', fontsize=fs, color='k',path_effects=[pe.withStroke(linewidth=3, foreground="white")], rotation=-90)
+        else:
+            ax.text(x_pos_top[i], y_top-offset, label, ha='center', va='center', fontsize=fs, color='k',path_effects=[pe.withStroke(linewidth=3, foreground="white")])
+        ax.plot(x_pos_top[i], y_top, 'o', color='k', markersize=6)
+    
+    # Draw bottom-layer nodes
+    for j, label in enumerate(labels_bottom_clean):
+        if rotate:
+            ax.text(x_pos_bot[j]  - 0.05, y_bot-offset, label, ha='center', va='top', fontsize=fs, color='k', rotation=-90)
+        else:
+            ax.text(x_pos_bot[j], y_bot-offset, label, ha='center', va='center', fontsize=fs, color='k')
+        ax.plot(x_pos_bot[j], y_bot, 'o', color='k', markersize=6)
+    
+    sc = 8
+    
+    MIcutoff = 0.05
+    # Draw arches signal MI (top layer)
+    for i, s in enumerate(labels_top):
+        for j, t in enumerate(labels_top):
+            strength = MIsigs.loc[s, t]#abs(corr[i, j])
+            if strength < MIcutoff:
+                continue
+            mid = (x_pos_top[i] + x_pos_top[j]) / 2
+            width = abs(x_pos_top[j] - x_pos_top[i])
+            height = width / 2
+            color = 'darkturquoise' if corr[i, j] > 0 else 'firebrick' #'darkmagenta'
+            linewidth = sc * strength
+            arc = Arc((mid, y_top), width=width, height=height, angle=0, theta1=0, theta2=180, color=color, linewidth=linewidth, alpha=0.6)
+            ax.add_patch(arc)
+    
+    # Draw lines between top and bottom layers, with thickness from conn
+    for i,s in enumerate(labels_top):
+        for j,f in enumerate(labels_bottom):
+            strength = MI.loc[s, f]
+            if strength < MIcutoff:  # skip very weak
+                continue
+            color = 'darkturquoise' if allcorr.loc[s, f] > 0 else 'firebrick' #'darkmagenta'
+            linewidth = sc * strength
+            ax.plot([x_pos_top[i], x_pos_bot[j]], [y_top, y_bot],color=color, lw=linewidth, alpha=0.6, zorder=1)
+    
+    plt.tight_layout()
+    if rotate:
+        plt.savefig(dataDir + "/" + 'MI' + '_sig2sig_and_sig2fate_rotated_' + cond + file_suffix, bbox_inches='tight')
+    else:
+        plt.savefig(dataDir + "/" + 'MI' + '_sig2sig_and_sig2fate' + cond + file_suffix, bbox_inches='tight')
+
+    return MI, MIsigs
+
+#------------------------------------------------------------------------------------------------------------
+# ANALYSIS: general
 #------------------------------------------------------------------------------------------------------------
 
 def return_fates(data, thresh=1):
@@ -349,7 +829,50 @@ def calcPerformance(data, pred_subs, thresh, gene_names):
         
     return performances, recall_dict
     
+def sig2fate(data, signals, gene_names, N_run, hyperparam):
+    # returns average prediction for N_runs from list of signals
+    
+    preds = {}
+    
+    for it in range(N_run):
+    
+        print(f"  Run {it}/{N_run}")
+        start = time.time()
+    
+        pred_df = data[signals + gene_names].copy()
+    
+        # predict each colony in B50 based on the other colonies
+        colony_idx = np.unique(data['Colony'])
+        for test_colony in colony_idx:
+    
+            #print('B50 col: ' + str(test_colony))
+            
+            # split data into test and train by colonies
+            train_colonies = np.setdiff1d(colony_idx, test_colony)
+            data_test = data[data['Colony'].isin([test_colony])]
+            data_train = data[data['Colony'].isin(train_colonies)]
+    
+            feat_train = data[signals] 
+            feat_test = data[signals]
+            tar_train = data[gene_names]
+    
+            # run VIB
+            vib = VIB(feat_train, tar_train, hyperparam)
+            tar_predict = vib.predict(feat_test)
+            pred_df.loc[tar_predict.index, tar_predict.columns] = tar_predict
 
+        preds[it] = pred_df
+    
+        end = time.time()
+        print(f"Elapsed time: {end - start} seconds")
+    
+    # average runs
+    pred_mean_df = pd.concat(list(preds.values())).groupby(level=0).mean()
+
+    # WARNING: THIS IS A PLACEHOLDER, I SOMEHOW DELETED A VERSION OF THIS CODE THAT RETURNS PREDICTION ON TRAINING DATA TO TEST OVERFITTING, CAN RESTORE LATER
+    pred_mean_train_df = pred_mean_df
+    
+    return pred_mean_df, pred_mean_train_df
 
 class VIB:
 
@@ -365,43 +888,32 @@ class VIB:
             'BETA' : 0.01
         }
         hyperparam = hyperparam or {} # if not provided make an empty dict
-        hyperparam = {**defaults, **hyperparam} # merge dictionaries second overrides first
+        self.hyperparam = {**defaults, **hyperparam} # merge dictionaries second overrides first
  
         N_DIM_INPUT = feat_train.shape[1]
         N_DIM_OUTPUT = tar_train.shape[1]
 
-        self.tar_train = tar_train
-        
         # Standardize
         self.scaler_X_run = sklearn.preprocessing.StandardScaler()
         self.scaler_Y_run = sklearn.preprocessing.StandardScaler()
-        
-        feat_train_z = self.scaler_X_run.fit_transform(feat_train)
-        tar_train_z = self.scaler_Y_run.fit_transform(tar_train)
-        
-        # Convert to torch
-        X_train_run = torch.FloatTensor(feat_train_z).to(device)
-        Y_train_run = torch.FloatTensor(tar_train_z).to(device)
-        
+
+        self.tar_train = tar_train
+        self.feat_train_z = self.scaler_X_run.fit_transform(feat_train)
+        self.tar_train_z = self.scaler_Y_run.fit_transform(tar_train)
+
         # Create new VIB model (fresh random initialization each run)
         self.model = fns_NN.FlexibleVIB(
             input_dim=N_DIM_INPUT,
             output_dim=N_DIM_OUTPUT,
-            latent_dim=hyperparam['LATENT_DIM'],
-            hidden_dim=hyperparam['HIDDEN_DIM'],
-            n_layers=hyperparam['N_LAYERS'],
+            latent_dim=self.hyperparam['LATENT_DIM'],
+            hidden_dim=self.hyperparam['HIDDEN_DIM'],
+            n_layers=self.hyperparam['N_LAYERS'],
             encoder_type='nonlinear',
             decoder_type='nonlinear'
         ).to(device)
         
         # Train
-        _ = self.train(
-            X_train_run, Y_train_run,
-            epochs=hyperparam['EPOCHS'],
-            lr=hyperparam['LEARNING_RATE'],
-            beta=hyperparam['BETA'],
-            verbose=False
-        )
+        #_ = self.train(verbose=False)
 
     def predict(self, feat_test):
         
@@ -421,8 +933,15 @@ class VIB:
     
         return target_predict
 
-    def train(self, X_train, Y_train, epochs=800, lr=1e-3, #X_val, Y_val, 
-              beta=1.0, patience=10, min_delta=1e-4, verbose=False, print_every=200):
+    def train(self, patience=10, min_delta=1e-4, verbose=False, print_every=200):
+
+        # Convert to torch
+        X_train_run = torch.FloatTensor(self.feat_train_z).to(device)
+        Y_train_run = torch.FloatTensor(self.tar_train_z).to(device)
+
+        epochs=self.hyperparam['EPOCHS']
+        lr=self.hyperparam['LEARNING_RATE']
+        beta=self.hyperparam['BETA']
         
         optimizer = optim.Adam(self.model.parameters(), lr=lr)
 
@@ -431,8 +950,8 @@ class VIB:
         for epoch in range(epochs):
             
             optimizer.zero_grad()
-            recon, mu, logvar = self.model(X_train)
-            target = Y_train
+            recon, mu, logvar = self.model(X_train_run)
+            target = Y_train_run
             
             recon_loss = torch.nn.MSELoss()(recon, target)
             kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / target.size(0)
