@@ -284,6 +284,7 @@ def clean_data(feature, target):
     indices : np.ndarray
         Indices of non-NaN rows
     """
+    
     # Reshape to 2D if needed
     feature_flat = feature.reshape(-1, feature.shape[-1])
     target_flat = target.reshape(-1, target.shape[-1])
@@ -327,11 +328,12 @@ def clean_data_full_v2(feature, target, metricdist, markers):
     markers_clean : np.ndarray
         Cleaned markers array
     """
+
     N_sys = feature.shape[0]
     N_part_max = feature.shape[1]
     
     feature_clean, target_clean, indices = clean_data(feature, target)
-        
+
     metricdist_clean = metricdist.reshape((int(N_sys * N_part_max)))[indices]
     markers_clean = markers.reshape((int(N_sys * N_part_max)))[indices]
     
@@ -372,6 +374,7 @@ def test_train_split_colonies(data, feature, target, train_size=3):
     markers_test : np.ndarray
         Testing markers
     """
+    
     # Split test/train by colony
     N_sys = feature.shape[0]
     N_tar = target.shape[2]
@@ -379,25 +382,25 @@ def test_train_split_colonies(data, feature, target, train_size=3):
     test_size = N_sys - train_size
     
     # Use first N=test_size colonies for testing, so colony 1 can be used for plotting
-    feature_test = feature[:test_size, :, :]
-    target_test = target[:test_size, :, :]
+    feat_test = feature[:test_size, :, :]
+    tar_test = target[:test_size, :, :]
     metricdist_test = data.metricdist[:test_size, :]
     markers_test = data.markers[:test_size, :]
     
     # Use last colonies for training
-    feature_train = feature[-train_size:, :, :] 
-    target_train = target[-train_size:, :, :]
+    feat_train = feature[-train_size:, :, :] 
+    tar_train = target[-train_size:, :, :]
     metricdist_train = data.metricdist[-train_size:, :]
     markers_train = data.markers[-train_size:, :]
 
     # Clean train data
     feat_train, tar_train, metricdist_train, markers_train = clean_data_full_v2(
-        feature_train, target_train, metricdist_train, markers_train
+        feat_train, tar_train, metricdist_train, markers_train
     )
     
     # Clean test data
     feat_test, tar_test, metricdist_test, markers_test = clean_data_full_v2(
-        feature_test, target_test, metricdist_test, markers_test
+        feat_test, tar_test, metricdist_test, markers_test
     )
     
     if N_tar == 1:

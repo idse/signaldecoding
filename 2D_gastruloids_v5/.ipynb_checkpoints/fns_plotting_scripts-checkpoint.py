@@ -90,6 +90,7 @@ def return_fates(G,gene_names,thresh=1):
     """
     fate_names = ['AMLC','PGCLC','PSLC','meso','pluri','ecto', 'junk']
     N_cells = G.shape[0]
+    #print(G.shape)
     
     markers_colony = np.zeros(N_cells)
     markers_colony[:] = np.nan
