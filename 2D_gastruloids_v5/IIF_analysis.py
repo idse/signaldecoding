@@ -210,6 +210,66 @@ def getPreds(data, cond, dataDir, signal_chains, fatemarker, gene_names, hyperpa
 
     return mean_preds, mean_train_preds
 
+# i can probably merge this with getPreds - do later when there is time
+
+def getPreds2(data, dataDir, signal_combinations, gene_names, hyperparam, N_run=3, save=True):
+
+    pred_subs = {}
+    conditions = np.unique(data['condition'])
+    
+    for signals in signal_combinations:
+
+        sig_str = '_'.join(sorted(signals))
+    
+        if os.path.exists(dataDir + '/Fig3_VIB_' + sig_str + '_B50predonly.csv'):
+            print(f'loading: {sig_str}')
+            pred_mean_df = pd.read_csv(dataDir + '/Fig3_VIB_' + sig_str + '_B50predonly.csv', index_col=0)
+            pred_mean_df['condition'] = data['condition']
+            
+        else:
+            print(f'calculating: {sig_str}')
+            pred_df = data.copy()   
+            data_B50 = data[data['condition']=='B50']
+            mean_pred,_ = sig2fate(data_B50, signals, gene_names, N_run, hyperparam)
+            pred_df.loc[mean_pred.index, mean_pred.columns] = mean_pred
+            
+            # then predict other conditions based on all B50 colonies
+            start = time.time()
+            preds = {}
+            for it in range(N_run):
+
+                # set seeds for reproducibility
+                torch.manual_seed(it)
+                np.random.seed(it)
+                if torch.backends.mps.is_available():
+                    torch.mps.manual_seed(it)
+                    
+                preds[it] = pred_df.copy()
+                
+                data_train = data_B50
+                feat_train = data_train[signals]
+                tar_train = data_train[gene_names] 
+                vib = VIB(feat_train, tar_train, hyperparam)
+                _ = vib.train(verbose=False) 
+                
+                for cond in [c for c in conditions if c != 'B50']:
+            
+                    data_cond = data[data['condition']==cond]
+                    feat_test = data_cond[signals]
+                    tar_predict = vib.predict(feat_test)
+                    preds[it].loc[tar_predict.index, tar_predict.columns] = tar_predict
+
+            pred_mean_df = pd.concat(list(preds.values())).groupby(level=0).mean(numeric_only=True)
+            if save:
+                pred_mean_df.to_csv(dataDir + '/Fig3_VIB_' + sig_str + '_B50predonly.csv')
+            end = time.time()
+            print(f"Elapsed time: {end - start} seconds")
+            
+        pred_subs[sig_str] = {'avg':pred_mean_df}
+
+    return pred_subs
+    
+
 def col_meanstd(MI_dec):
 
     genelist = list(MI_dec.keys())
@@ -528,7 +588,7 @@ def plotRedundantMI(dataDir, data, cond, markergenes, signals, N_run, hyperparam
     #plt.legend()
 
     
-def plotMIgraph(dataDir, data, cond, signames, markernames, signames_clean=None, markernames_clean=None, rotate=True, ax=None, fs=12, file_suffix='.png'):
+def plotMIgraph(dataDir, data, cond, signames, markernames, signames_clean=None, markernames_clean=None, rotate=True, ax=None, fs=12, file_suffix='.png', sig2sig=True):
 
     if not signames_clean: signames_clean = signames
     if not markernames_clean: markernames_clean = markernames
@@ -602,7 +662,11 @@ def plotMIgraph(dataDir, data, cond, signames, markernames, signames_clean=None,
     # Draw top-layer nodes
     for i, label in enumerate(labels_top_clean):
         if rotate:
-            ax.text(x_pos_top[i], y_top-offset, label, ha='center', va='top', fontsize=fs, color='k',path_effects=[pe.withStroke(linewidth=3, foreground="white")], rotation=-90)
+            if sig2sig:
+                ax.text(x_pos_top[i], y_top-offset, label, ha='center', va='top', fontsize=fs, color='k',path_effects=[pe.withStroke(linewidth=3, foreground="white")], rotation=-90)
+            else:
+                offset = 0.15
+                ax.text(x_pos_top[i], y_top+offset, label, ha='center', va='bottom', fontsize=fs, color='k',path_effects=[pe.withStroke(linewidth=3, foreground="white")], rotation=-90, fontfamily='Arial Narrow')
         else:
             ax.text(x_pos_top[i], y_top-offset, label, ha='center', va='center', fontsize=fs, color='k',path_effects=[pe.withStroke(linewidth=3, foreground="white")])
         ax.plot(x_pos_top[i], y_top, 'o', color='k', markersize=6)
@@ -610,7 +674,10 @@ def plotMIgraph(dataDir, data, cond, signames, markernames, signames_clean=None,
     # Draw bottom-layer nodes
     for j, label in enumerate(labels_bottom_clean):
         if rotate:
-            ax.text(x_pos_bot[j]  - 0.05, y_bot-offset, label, ha='center', va='top', fontsize=fs, color='k', rotation=-90)
+            if sig2sig:
+                ax.text(x_pos_bot[j]  - 0.05, y_bot-offset, label, ha='center', va='top', fontsize=fs, color='k', rotation=-90)
+            else:
+                ax.text(x_pos_bot[j]  - 0.05, y_bot-offset, label, ha='center', va='top', fontsize=fs, color='k', rotation=-90, fontfamily='Arial Narrow')
         else:
             ax.text(x_pos_bot[j], y_bot-offset, label, ha='center', va='center', fontsize=fs, color='k')
         ax.plot(x_pos_bot[j], y_bot, 'o', color='k', markersize=6)
@@ -618,19 +685,20 @@ def plotMIgraph(dataDir, data, cond, signames, markernames, signames_clean=None,
     sc = 8
     
     MIcutoff = 0.05
-    # Draw arches signal MI (top layer)
-    for i, s in enumerate(labels_top):
-        for j, t in enumerate(labels_top):
-            strength = MIsigs.loc[s, t]#abs(corr[i, j])
-            if strength < MIcutoff:
-                continue
-            mid = (x_pos_top[i] + x_pos_top[j]) / 2
-            width = abs(x_pos_top[j] - x_pos_top[i])
-            height = width / 2
-            color = 'darkturquoise' if corr[i, j] > 0 else 'firebrick' #'darkmagenta'
-            linewidth = sc * strength
-            arc = Arc((mid, y_top), width=width, height=height, angle=0, theta1=0, theta2=180, color=color, linewidth=linewidth, alpha=0.6)
-            ax.add_patch(arc)
+    if sig2sig:
+        # Draw arches signal MI (top layer)
+        for i, s in enumerate(labels_top):
+            for j, t in enumerate(labels_top):
+                strength = MIsigs.loc[s, t]#abs(corr[i, j])
+                if strength < MIcutoff:
+                    continue
+                mid = (x_pos_top[i] + x_pos_top[j]) / 2
+                width = abs(x_pos_top[j] - x_pos_top[i])
+                height = width / 2
+                color = 'darkturquoise' if corr[i, j] > 0 else 'firebrick' #'darkmagenta'
+                linewidth = sc * strength
+                arc = Arc((mid, y_top), width=width, height=height, angle=0, theta1=0, theta2=180, color=color, linewidth=linewidth, alpha=0.6)
+                ax.add_patch(arc)
     
     # Draw lines between top and bottom layers, with thickness from conn
     for i,s in enumerate(labels_top):
@@ -643,11 +711,14 @@ def plotMIgraph(dataDir, data, cond, signames, markernames, signames_clean=None,
             ax.plot([x_pos_top[i], x_pos_bot[j]], [y_top, y_bot],color=color, lw=linewidth, alpha=0.6, zorder=1)
     
     plt.tight_layout()
+    prefix = '_sig2fate_'
+    if sig2sig:
+        prefix = '_sig2sig_and' + prefix
     if rotate:
-        plt.savefig(dataDir + "/" + 'MI' + '_sig2sig_and_sig2fate_rotated_' + cond + file_suffix, bbox_inches='tight')
-    else:
-        plt.savefig(dataDir + "/" + 'MI' + '_sig2sig_and_sig2fate' + cond + file_suffix, bbox_inches='tight')
-
+        prefix = prefix + 'rotated_'
+    
+    plt.savefig(dataDir + "/" + 'MI' + prefix + cond + file_suffix, bbox_inches='tight')
+    
     return MI, MIsigs
 
 #------------------------------------------------------------------------------------------------------------
@@ -835,7 +906,13 @@ def sig2fate(data, signals, gene_names, N_run, hyperparam):
     preds = {}
     
     for it in range(N_run):
-    
+        
+        # set seeds for reproducibility
+        torch.manual_seed(it)
+        np.random.seed(it)
+        if torch.backends.mps.is_available():
+            torch.mps.manual_seed(it)
+            
         print(f"  Run {it}/{N_run}")
         start = time.time()
     
@@ -858,6 +935,7 @@ def sig2fate(data, signals, gene_names, N_run, hyperparam):
     
             # run VIB
             vib = VIB(feat_train, tar_train, hyperparam)
+            _ = vib.train(verbose=False) 
             tar_predict = vib.predict(feat_test)
             pred_df.loc[tar_predict.index, tar_predict.columns] = tar_predict
 
@@ -1035,7 +1113,8 @@ class Position:
         
         data = self.cellData['intensities'];
         fates, fate_names = return_fates(data, thresh)
-        colors = fns_plot.return_colmaps('fates')
+        colors = colmap_fates
+        #fate_names = list(colmap_fates.keys()) # for different plotting order from outside to 
 
         X = (self.cellData['XY']['X'] - self.center[0])*self.resolution
         Y = (self.cellData['XY']['Y'] - self.center[1])*self.resolution
@@ -1362,7 +1441,7 @@ class MPexperiment(Experiment):
                 # conditionPosVars = [c.posError**2 for c in conditionCols];
                 # self.posErrorIntrinsic[cond] = pd.concat(conditionPosVars).groupby(level=0).mean().applymap(np.sqrt)
             
-    def plotRadialProfiles(self, channel, condition, mode='cells', sigma=0, color = 'blue', ax=None, normalize=False):
+    def plotRadialProfiles(self, channel, condition, mode='cells', sigma=0, color = 'blue', ax=None, normalize=False, errorbars=True):
 
         r = self.radialGrids[condition];
         dr = 10
@@ -1381,7 +1460,8 @@ class MPexperiment(Experiment):
                 yerr = yerr/(max(y)-min(y))
                 y = y/(max(y)-min(y))
             h, = ax.plot(r[idx], y[idx], color=color)
-            ax.fill_between(r[idx], y[idx] - yerr[idx], y[idx] + yerr[idx], alpha=0.3, color=color, edgecolor='none')
+            if errorbars:
+                ax.fill_between(r[idx], y[idx] - yerr[idx], y[idx] + yerr[idx], alpha=0.3, color=color, edgecolor='none')
         
         elif mode=='colonies':
             y = self.radialProfiles[condition][channel]
@@ -1392,7 +1472,8 @@ class MPexperiment(Experiment):
                 # yerr = yerr/max(y)
                 # y = y/max(y)
             h, = ax.plot(r[idx], y[idx], color=color)
-            ax.fill_between(r[idx], y[idx] - yerr[idx], y[idx] + yerr[idx], alpha=0.3, color=color, edgecolor='none')
+            if errorbars:
+                ax.fill_between(r[idx], y[idx] - yerr[idx], y[idx] + yerr[idx], alpha=0.3, color=color, edgecolor='none')
             # ADD THIS: return statement was missing for colonies mode
             
         elif mode=='colonies_individual':
@@ -1408,7 +1489,9 @@ class MPexperiment(Experiment):
         ax.set_ylabel("intensity")
         ax.set_xlabel(r"edge distance ($\mu m$)")
         ax.set_xlim((0, self.radiusMicron[condition]))
-        ax.set_ylim(bottom=0)    
+        ax.set_ylim(bottom=0)
+        if not errorbars:
+            ax.set_ylim(top=max(y)*1.2)
     
         return h 
     
