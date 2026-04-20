@@ -1,0 +1,5 @@
+{
+  "extraPaths": ["2D_gastruloids_v5"],
+  "reportMissingModuleSource": "none",
+  "reportMissingImports": "none"
+}

@@ -176,12 +176,136 @@ def data2david(data, features):
 
     return arr
 
-import matplotlib.patheffects as pe
-from matplotlib.patches import Arc
+
+#------------------------------------------------------------------------------------------------------------
+# ANALYSIS: CROSSTALK PREDICTION (KNN)
+#------------------------------------------------------------------------------------------------------------
+
+from sklearn.neighbors import NearestNeighbors
+
+# Apply various smoothing methods to signal data
+def apply_smoothing(signals, k_val, mode='gaussian'):
+    # signals: numpy array
+
+    distances, indices = NearestNeighbors(n_neighbors= k_val, n_jobs=-1).fit(
+        sklearn.preprocessing.StandardScaler().fit_transform(signals)).kneighbors()
+    
+    if mode == 'simple':
+        neighbor_signals = signals[indices[:, :k_val]]
+        smoothed = neighbor_signals.mean(axis=1)
+        
+    elif mode == 'gaussian':
+        neighbor_signals = signals[indices[:, :k_val]]
+        sigma = np.maximum(distances[:, k_val-1:k_val], 1e-10)
+        weights = np.exp(-0.5 * (distances[:, :k_val] / sigma) ** 2)
+        smoothed = np.einsum('ij,ijk->ik', 
+                                weights / weights.sum(axis=1, keepdims=True), 
+                                neighbor_signals)
+    
+    return smoothed
+
+#----------------------------------------------------------------------------------
+
+def determine_threshold(data, perturbing_sigs, perturb_mode='inh', use_profile=None, percentile=1):
+    # perturb_mode = 'inh' : change to 'act' for activating drug
+    # use_profile : pass an experiment object from which to use the radial profile min/max as thresholds
+
+    if perturb_mode == 'inh':
+        if use_profile:
+            return np.min(use_profile.radialProfiles['B50'][perturbing_sigs])
+        else:
+            threshold = np.percentile(data[perturbing_sigs], percentile)
+            print(threshold)
+            return threshold
+    elif perturb_mode == 'act':
+        if use_profile:
+            return np.max(use_profile.radialProfiles['B50'][perturbing_sigs])
+        else:
+            return np.percentile(data[perturbing_sigs], 100 - percentile)
+    else:
+        raise ValueError(f"Unknown perturb_mode: {perturb_mode}")
+
+#----------------------------------------------------------------------------------
+
+# Create perturbed dataset using KNN from low-perturbation cells
+def create_perturbed_data(data, signal_names, perturbing_sigs, threshold, perturb_mode='inh', do_naive=True,
+                         k_nn=5, distance_signals=None, preserve_signals=None):
+
+    # data: only the reference data for projection (so restrict e.g. to B50 before calling if that is the goal)
+
+    # Z-normalize
+    data_z = data.copy()
+    data_z[signal_names] = (data[signal_names] - data[signal_names].mean()) / data[signal_names].std()
+
+    # Define subset based on perturbation
+    if perturb_mode == 'inh':
+        subset_mask = (data[perturbing_sigs].values <= threshold).all(axis=1)
+    elif perturb_mode == 'act':
+        subset_mask = (data[perturbing_sigs].values >= threshold).all(axis=1)
+    else:
+        raise ValueError(f"Unknown perturb_mode: {perturb_mode}")
+
+    if do_naive:
+        data_perturbed = data.copy()
+        data_perturbed[perturbing_sigs] = threshold
+
+        data_perturbed_z = (data_perturbed[signal_names] - data[signal_names].mean()) / data[signal_names].std()
+        return data_perturbed, data_perturbed_z
+
+    else:
+        data_subset = data[subset_mask]
+        data_z_subset = data_z[subset_mask]
+        
+        print(f"Perturbation subset: {subset_mask.sum()} / {len(data)} cells ({100*subset_mask.mean():.1f}%)")
+        
+        # Distance signals
+        if distance_signals is None:
+            distance_signals = [s for s in signal_names if s not in perturbing_sigs]
+        
+        # Fit KNN and find neighbors
+        knn_model = NearestNeighbors(n_neighbors=k_nn, metric='euclidean')
+        knn_model.fit(data_z_subset[distance_signals])
+        distances, indices = knn_model.kneighbors(data_z[distance_signals])
+        
+        # Gaussian weighted averaging
+        subset_signals = data_subset[signal_names].values
+        sigma = np.maximum(distances[:, -1:], 1e-10)
+        weights = np.exp(-0.5 * (distances / sigma) ** 2)
+        mean_signals = np.einsum('ij,ijk->ik', 
+                                weights / weights.sum(axis=1, keepdims=True), 
+                                subset_signals[indices])
+
+        # Gaussian weighted averaging (z_norm)
+        subset_signals_z = data_z_subset[signal_names].values
+        sigma = np.maximum(distances[:, -1:], 1e-10)
+        weights = np.exp(-0.5 * (distances / sigma) ** 2)
+        mean_signals_z = np.einsum('ij,ijk->ik', 
+                                weights / weights.sum(axis=1, keepdims=True), 
+                                subset_signals_z[indices])
+        
+        # Create output
+        data_perturbed = data.copy()
+        data_perturbed[signal_names] = mean_signals
+
+        # Create z-normalized output
+        data_perturbed_z = data_z.copy()
+        data_perturbed_z[signal_names] = mean_signals_z
+        
+        # Optional: Preserve specific signals in control
+        if preserve_signals:
+            for sig in preserve_signals:
+                if sig in signal_names:
+                    data_perturbed[sig] = data[sig]
+                    data_perturbed_z[sig] = data_z[sig]
+        
+        return data_perturbed, data_perturbed_z, subset_mask
 
 #------------------------------------------------------------------------------------------------------------
 # ANALYSIS: INFORMATION
 #------------------------------------------------------------------------------------------------------------
+
+import matplotlib.patheffects as pe
+from matplotlib.patches import Arc
 
 def getPreds(data, cond, dataDir, signal_chains, fatemarker, gene_names, hyperparam, N_run, save=True):
 
