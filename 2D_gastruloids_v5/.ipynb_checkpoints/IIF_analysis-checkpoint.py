@@ -216,20 +216,22 @@ def getPreds2(data, dataDir, signal_combinations, gene_names, hyperparam, N_run=
 
     pred_subs = {}
     conditions = np.unique(data['condition'])
+    data_B50 = data[data['condition']=='B50']
     
     for signals in signal_combinations:
 
         sig_str = '_'.join(sorted(signals))
-    
-        if os.path.exists(dataDir + '/Fig3_VIB_' + sig_str + '_B50predonly.csv'):
-            print(f'loading: {sig_str}')
-            pred_mean_df = pd.read_csv(dataDir + '/Fig3_VIB_' + sig_str + '_B50predonly.csv', index_col=0)
+
+        fname = dataDir + '/Fig3_VIB_' + sig_str + '_B50predonly.csv'
+        
+        if os.path.exists(fname):
+            print(f'loading: {fname}')
+            pred_mean_df = pd.read_csv(fname, index_col=0)
             pred_mean_df['condition'] = data['condition']
             
         else:
-            print(f'calculating: {sig_str}')
+            print(f'calculating: {fname}')
             pred_df = data.copy()   
-            data_B50 = data[data['condition']=='B50']
             mean_pred,_ = sig2fate(data_B50, signals, gene_names, N_run, hyperparam)
             pred_df.loc[mean_pred.index, mean_pred.columns] = mean_pred
             
@@ -260,11 +262,18 @@ def getPreds2(data, dataDir, signal_combinations, gene_names, hyperparam, N_run=
                     preds[it].loc[tar_predict.index, tar_predict.columns] = tar_predict
 
             pred_mean_df = pd.concat(list(preds.values())).groupby(level=0).mean(numeric_only=True)
+            
+            # add back non-numeric columns from original data
+            non_numeric_cols = data.select_dtypes(exclude='number').columns
+            for col in non_numeric_cols:
+                if col in data.columns:
+                    pred_mean_df[col] = data[col]
+
             if save:
-                pred_mean_df.to_csv(dataDir + '/Fig3_VIB_' + sig_str + '_B50predonly.csv')
+                pred_mean_df.to_csv(fname)
             end = time.time()
             print(f"Elapsed time: {end - start} seconds")
-            
+
         pred_subs[sig_str] = {'avg':pred_mean_df}
 
     return pred_subs
@@ -1109,32 +1118,35 @@ class Position:
 
         return (vmin, vmax)
 
-    def scatter_fates(self, ms=1, legend=True, ax=None, thresh=1, fate='all'):
-        
-        data = self.cellData['intensities'];
+    def scatter_fates(self, ms=1, legend=True, ax=None, thresh=1, fate='all', imageCoordinates=False):
+    
+        data = self.cellData['intensities']
         fates, fate_names = return_fates(data, thresh)
-        colors = colmap_fates
-        #fate_names = list(colmap_fates.keys()) # for different plotting order from outside to 
-
-        X = (self.cellData['XY']['X'] - self.center[0])*self.resolution
-        Y = (self.cellData['XY']['Y'] - self.center[1])*self.resolution
+        colors = fns_plot.return_colmaps('fates')
+    
+        if imageCoordinates:
+            X = self.cellData['XY']['X']
+            Y = self.cellData['XY']['Y']
+        else:
+            X = (self.cellData['XY']['X'] - self.center[0]) * self.resolution
+            Y = (self.cellData['XY']['Y'] - self.center[1]) * self.resolution
         
-        if ax==None:
-            fig, ax = plt.subplots(1,1)
+        if ax is None:
+            fig, ax = plt.subplots(1, 1)
         
         for i, f in enumerate(fate_names):
-
-            idx = fates == f;
+    
+            idx = fates == f
             
             if (fate == 'all') or (fate == f):
-                scatter = ax.scatter(X[idx], Y[idx], color=colmap_fates[f], s=ms, edgecolors='none');
+                scatter = ax.scatter(X[idx], Y[idx], color=colmap_fates[f], s=ms, edgecolors='none')
             else:
-                scatter = ax.scatter(X[idx], Y[idx], color='lightgray', s=ms, edgecolors='none');
+                scatter = ax.scatter(X[idx], Y[idx], color='lightgray', s=ms, edgecolors='none')
                 
         if legend:
             ax.legend(fate_names)
-        ax.set_aspect('equal') 
-        ax.axis('off');
+        ax.set_aspect('equal')
+        ax.axis('off')
         
 class Colony(Position):
     # Colony extends Position to include features and methods specific to disc-shaped micropatterned colonies, like radiusMicron and makeRadialProfile(..)
