@@ -1181,16 +1181,19 @@ class VIB:
 
 class Metadata: 
 
-    def __init__(self):
+    def __init__(self, data=None):
 
         self.xres = np.nan;
         self.yres = np.nan;
         self.channels = [];
         self.conditions = [];
+    
+        if data is not None:
+            self.conditionPositions = data.groupby('condition')['Colony'].unique()
 
     def conditionStartPos(self, condition):
-        # provide the first position for absa given condition
-        print('TODO: implement')
+        # provide the first position for given condition
+        return min(self.conditionPositions[condition])
 
     @property
     def nChannels(self):
