@@ -5,6 +5,8 @@ import scipy as sp
 import scipy.interpolate as interp
 from scipy.ndimage import gaussian_filter1d
 import sklearn
+from sklearn.preprocessing import StandardScaler
+from scipy import stats
 
 import torch
 device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
@@ -122,7 +124,7 @@ def adjust_contrast(im, tol):
     im_rescale = exposure.rescale_intensity(im, in_range=(Imin,Imax),out_range=(0,255))
     return(im_rescale)
 
-def makeRGBoverlay(coli, markers, dataDir, rdStr='RD', Ilim=None):
+def makeRGBoverlay_v1(coli, markers, dataDir, rdStr='RD', Ilim=None):
     
     MIPca = {}
 
@@ -148,7 +150,270 @@ def makeRGBoverlay(coli, markers, dataDir, rdStr='RD', Ilim=None):
     RGBoverlay=RGBoverlay.astype(np.uint8)
         
     return RGBoverlay
+
+
+
+def makeRGBbase(col, coli, markers, dataDir, crop_margin, center_x_margin, center_y_margin,
+                rdStr='Rd', Ilim=None, percentiles=None,
+                partial_MIP=False, starting_slice=6, stack_length=5, pie_sectors=False,
+                grayscale_background=False, outer_margin=50, boundary_width=7):
+    """Build and return the base RGB composite."""
+
+    def load_MIP(mrkr):
+        if partial_MIP:
+            return makeMIPs(coli, mrkr, dataDir, rdStr, starting_slice, stack_length)
+        fname = getImageFilename(coli, mrkr, dataDir, rdStr, imtype='MIP')
+        print('loading', fname)
+        return imio.imread(fname)
+
+    def get_Ilimits(MIP, mrkr):
+        if Ilim is not None and mrkr in Ilim:
+            lo, hi = Ilim[mrkr]
+        elif percentiles is not None and mrkr in percentiles:
+            lo, hi = np.percentile(MIP[MIP > 0], percentiles[mrkr])
+        else:
+            lo, hi = np.percentile(MIP[MIP > 0], tol.get(mrkr, [1, 99]))
+        return float(lo), float(hi)
+
+    def rescale(MIP, mrkr):
+        return exposure.rescale_intensity(MIP, in_range=get_Ilimits(MIP, mrkr), out_range=(0, 255))
+
+    # Load & rescale markers
+    MIPca  = {m: rescale(load_MIP(m), m) for m in markers}
+    center = (col[coli].cellData['XY'].loc[:, ['X', 'Y']].mean(axis=0)
+          + [center_x_margin, center_y_margin]).to_numpy() 
+    radius = col[coli].radiusPixel + crop_margin
+
+    # Pad to guarantee crop never hits boundary
+    pad    = int(np.ceil(radius)) + outer_margin
+    center = center + pad
+    MIPca  = {m: np.pad(img, pad, mode='constant', constant_values=0)
+              for m, img in MIPca.items()}
+
+    h, w = list(MIPca.values())[0].shape[:2]
+    Y, X = np.ogrid[:h, :w]
+
+    # Build composite
+    if pie_sectors and len(markers) > 1:
+        N     = len(markers)
+        angle = np.mod(np.arctan2(Y - center[1], X - center[0]) + np.pi / 2, 2 * np.pi)
+
+        grayscale_composite = np.zeros((h, w), dtype=np.float32)
+        sector_masks        = []
+        for i in range(N):
+            angle_start = i * 2 * np.pi / N
+            angle_end   = (i + 1) * 2 * np.pi / N
+            mask_sector = (
+                (angle >= angle_start) & (angle < angle_end) if angle_end > angle_start
+                else (angle >= angle_start) | (angle < angle_end)
+            )
+            sector_masks.append(mask_sector)
+            grayscale_composite += MIPca[markers[i]] * mask_sector
+
+        from scipy.ndimage import binary_dilation
+        lines = np.zeros((h, w), dtype=bool)
+        for mask_sector in sector_masks:
+            lines |= binary_dilation(mask_sector, structure=create_circular_struct_elem(boundary_width)) ^ mask_sector
+
+        RGBbase = np.stack([grayscale_composite] * 3, axis=2)
+        RGBbase[lines] = 255
+
+    else:
+        channels  = [MIPca[m].astype(np.float32) for m in markers[:3]]
+        channels += [np.zeros((h, w), dtype=np.float32)] * (3 - len(channels))
+        RGBbase   = np.stack(channels, axis=2)
+
+    RGBbase = np.clip(RGBbase, 0, 255).astype(np.uint8)
+
+    # Crop to square
+    side   = int(np.ceil(radius * 2)) + 2 * outer_margin
+    cx, cy = np.round(center).astype(int)
+    RGBbase = RGBbase[cy - side // 2 : cy + side // 2,
+                      cx - side // 2 : cx + side // 2]
+
+
+    #  Circular alpha mask
+    hh, ww = RGBbase.shape[:2]
+    Y2, X2 = np.ogrid[:hh, :ww]
+    mask   = (np.sqrt((Y2 - hh / 2) ** 2 + (X2 - ww / 2) ** 2) <= radius).astype(np.uint8) * 255
+    RGBbase = np.dstack([RGBbase, mask])
+
+    # Return base image + metadata needed for overlay step
+    meta = dict(radius=radius, outer_margin=outer_margin,
+                grayscale_background=grayscale_background,
+                center=center, pad=pad, h=h, w=w,
+                dataDir=dataDir, coli=coli, rdStr=rdStr,
+                Ilim=Ilim, percentiles=percentiles)
+    return RGBbase, meta
+
+
+def applyOverlay(RGBbase, meta, overlay_marker, overlay_alpha=1):
+    """Apply a single overlay channel to a prebuilt base image."""
+
+    def get_Ilimits(MIP, mrkr):
+        Ilim, percentiles = meta['Ilim'], meta['percentiles']
+        if Ilim is not None and mrkr in Ilim:
+            lo, hi = Ilim[mrkr]
+        elif percentiles is not None and mrkr in percentiles:
+            lo, hi = np.percentile(MIP[MIP > 0], percentiles[mrkr])
+        else:
+            lo, hi = np.percentile(MIP[MIP > 0], tol.get(mrkr, [1, 99]))
+        return float(lo), float(hi)
+
+    radius               = meta['radius']
+    grayscale_background = meta['grayscale_background']
+    outer_margin         = meta['outer_margin']
+    pad                  = meta['pad']
+    center               = meta['center']
+
+    # Remove alpha before blending 
+    if RGBbase.shape[-1] == 4:
+        alpha_channel = RGBbase[..., 3]          # save it
+        RGBbase_rgb   = RGBbase[..., :3]         # work on RGB only
+    else:
+        alpha_channel = None
+        RGBbase_rgb   = RGBbase
+
+    # Load & rescale overlay marker
+    fname       = getImageFilename(meta['coli'], overlay_marker, meta['dataDir'], meta['rdStr'])
+    print('loading overlay', fname)
+    MIP_overlay = imio.imread(fname)
+    MIP_overlay = exposure.rescale_intensity(
+        MIP_overlay, in_range=get_Ilimits(MIP_overlay, overlay_marker), out_range=(0, 255)
+    )
+
+    # Pad + crop overlay to match base image geometry
+    MIP_overlay  = np.pad(MIP_overlay, pad, mode='constant', constant_values=0)
+    side         = int(np.ceil(radius * 2)) + 2 * outer_margin
+    cx, cy       = np.round(center).astype(int)
+    overlay_crop = MIP_overlay[cy - side // 2 : cy + side // 2,
+                               cx - side // 2 : cx + side // 2].astype(np.float32) / 255.0
+
+    # Blend onto RGB base
+    RGBoverlay = RGBbase_rgb.astype(np.float32)
+    if grayscale_background:
+        colored    = overlay_crop[..., None] * np.array([0, 1, 1]) * 255
+        RGBoverlay = ((1 - overlay_alpha * overlay_crop[..., None]) * RGBoverlay
+                      + overlay_alpha * overlay_crop[..., None] * colored)
+    else:
+        green          = np.zeros((*RGBbase_rgb.shape[:2], 3), dtype=np.float32)
+        green[:, :, 0] = overlay_crop * 255
+        RGBoverlay    += overlay_alpha * green
+
+    RGBoverlay = np.clip(RGBoverlay, 0, 255).astype(np.uint8)
+
+    # Recompute circular mask
+    if alpha_channel is not None:
+        RGBoverlay = np.dstack([RGBoverlay, alpha_channel])
+    else:
+        hh, ww = RGBoverlay.shape[:2]
+        Y, X   = np.ogrid[:hh, :ww]
+        mask   = (np.sqrt((Y - hh / 2) ** 2 + (X - ww / 2) ** 2) <= radius).astype(np.uint8) * 255
+        RGBoverlay = np.dstack([RGBoverlay, mask])
+
+    return RGBoverlay
+
+
+def makeRGBoverlay_colisectors(cols, colis, marker, dataDirs,
+                                crop_margin, reference_cols,
+                                center_x_margins, center_y_margins,
+                                rdStr='Rd', percentiles=None,
+                                partial_MIP=False, starting_slice=6, stack_length=5,
+                                outer_margin=0):
+    """
+    Create a pie-sector composite of grayscale MIPs, one sector per colony.
+    Intensity limits are averaged across reference colonies.
+    """
     
+
+    def load_MIP(coli, dataDir):
+        if partial_MIP:
+            return makeMIPs(coli, marker, dataDir, rdStr, starting_slice, stack_length)
+        return imio.imread(getImageFilename(coli, marker, dataDir, rdStr))
+    
+
+    # Intensity limits from reference colonies
+    pct  = percentiles.get(marker, [1, 99]) if percentiles else [1, 99]
+    lims = [np.percentile(load_MIP(ref, dataDirs[i])[load_MIP(ref, dataDirs[i]) > 0], pct)
+            for i, ref in enumerate(reference_cols)]
+    Imin = np.mean([l[0] for l in lims])
+    Imax = np.mean([l[1] for l in lims])
+    
+    # Load, rescale, get centers and radii
+    MIPs    = []
+    centers = []
+    radii   = []
+    
+    for i, coli in enumerate(colis):
+        mip = exposure.rescale_intensity(
+            load_MIP(coli, dataDirs[i]).astype(np.float32),
+            in_range=(Imin, Imax), out_range=(0, 255)
+        )
+        MIPs.append(mip)
+        centers.append(
+            cols[i][coli].cellData['XY'][['X', 'Y']].mean().values
+            + [center_x_margins[i], center_y_margins[i]]
+        )
+        radii.append(cols[i][coli].radiusPixel + crop_margin)
+    
+    # Canvas setup
+    side        = int(np.ceil(max(radii) * 2))
+    h = w       = side + 2 * outer_margin
+    cx = cy     = h // 2
+    Y, X        = np.ogrid[:h, :w]
+    
+    def crop_to_canvas(mip, center):
+        """Crop MIP around center into side x side canvas"""
+        cx_src, cy_src = np.round(center).astype(int)
+        half           = side // 2
+        canvas         = np.zeros((side, side), dtype=np.float32)
+        
+        y1 = max(cy_src - half, 0);  y2 = min(cy_src + half, mip.shape[0])
+        x1 = max(cx_src - half, 0);  x2 = min(cx_src + half, mip.shape[1])
+        yo = max(0, half - cy_src);  xo = max(0, half - cx_src)
+        
+        canvas[yo:yo + (y2 - y1), xo:xo + (x2 - x1)] = mip[y1:y2, x1:x2]
+        return canvas
+    
+
+    # Pie sectors
+    N         = len(colis)
+    angle_map = np.mod(np.arctan2(Y - cy, X - cx) + np.pi / 2, 2 * np.pi)
+    composite = np.zeros((h, w), dtype=np.float32)
+    
+    sector_masks = []
+    for i in range(N):
+        a0   = i * 2 * np.pi / N
+        a1   = (i + 1) * 2 * np.pi / N
+        mask = (angle_map >= a0) & (angle_map < a1)
+        sector_masks.append(mask)
+        
+        # Place cropped MIP into padded canvas
+        cropped             = np.zeros((h, w), dtype=np.float32)
+        om                  = outer_margin
+        cropped[om:om+side, om:om+side] = crop_to_canvas(MIPs[i], centers[i])
+        composite          += cropped * mask
+    
+    # Sector boundary lines
+    from scipy.ndimage import binary_dilation
+    struct  = create_circular_struct_elem(10)
+    lines   = np.zeros((h, w), dtype=bool)
+    for mask in sector_masks:
+        lines |= binary_dilation(mask, structure=struct) ^ mask
+    composite[lines] = 255
+    
+    # Circular alpha mask + output
+    r_map        = np.sqrt((Y - cy) ** 2 + (X - cx) ** 2)
+    alpha        = ((r_map <= max(radii) + outer_margin) * 255).astype(np.uint8)
+    gray         = np.clip(composite, 0, 255).astype(np.uint8)
+    RGBoverlay   = np.dstack([gray, gray, gray, alpha])
+    
+    return RGBoverlay
+    
+def create_circular_struct_elem(radius):
+    y, x = np.ogrid[-radius:radius+1, -radius:radius+1]
+    struct_elem = x**2 + y**2 <= radius**2
+    return struct_elem
 #------------------------------------------------------------------------------------------------------------
 # COMPATIBILTIY
 #------------------------------------------------------------------------------------------------------------
@@ -175,6 +440,91 @@ def data2david(data, features):
         arr[i, :len(colony_data), :] = colony_data
 
     return arr
+
+
+# ------------------------------------------------------------------------------------------------------------
+# EXPERIMENT LOADER (generic, project-agnostic)
+# ------------------------------------------------------------------------------------------------------------
+
+class ExperimentConfig:
+    # Stores project-specific configuration
+    def __init__(self, exp_params, signal_names, feature_names):
+        self.exp_params    = exp_params
+        self.signal_names  = signal_names
+        self.feature_names = feature_names
+
+
+def exp_loader(exp_name, config, normalize=True, normalization_condition='B50'):
+    exp_dir, csv_file, rename_dict, conditions, thresh, junk_csv = config.exp_params[exp_name]
+    gene_names = list(thresh.keys())
+    
+    data = pd.read_csv(os.path.join(exp_dir, csv_file))
+    data.rename(columns=rename_dict, inplace=True)
+    
+    if junk_csv:
+        junk = pd.read_csv(os.path.join(exp_dir, junk_csv)) == 2
+        data = data[~junk.iloc[:, 0].values]
+    
+    valid_mask = ~(data[config.signal_names + gene_names].isna() |
+                   (data[config.signal_names + gene_names] < 0)).any(axis=1)
+    data = data[valid_mask].reset_index(drop=True)
+    
+    if normalize:
+        norm_data = data[data['condition'] == normalization_condition]
+        norm_cols = config.signal_names + gene_names
+        data_z    = data.copy()
+        data_z[norm_cols] = (
+            (data[norm_cols] - norm_data[norm_cols].mean()) /
+             norm_data[norm_cols].std()
+        )
+    else:
+        data_z = data.copy()
+    
+    meta            = Metadata()
+    meta.xres       = meta.yres = 0.325
+    meta.channels   = config.signal_names + gene_names
+    meta.conditions = conditions
+    
+    return exp_dir, data, data_z, thresh, meta, gene_names
+
+
+def create_experiment(data, meta, feature_names, cellsPerBin=50):
+    colonies = {
+        colID: Colony(data[data['Colony'] == colID], colID, meta,
+                      features=feature_names, nominalRadius=350)
+        for colID in data['Colony'].unique()
+    }
+    for col in colonies.values():
+        col.calcRadialProfiles(cellsPerBin=cellsPerBin, overlap=0, dr=8)
+        col.calcPosError(sigma=1)
+    
+    exp = MPexperiment(colonies, meta)
+    exp.calcRadialProfiles(cellsPerBin=cellsPerBin, overlap=0)
+    return colonies, exp
+
+
+class ExperimentResults:
+    def __init__(self, exp_id, config):
+        self.exp_dir, self.data, self.data_z, \
+        self.thresh, self.meta, self.gene_names = exp_loader(exp_id, config)
+        
+        self.signal_names  = config.signal_names
+        self.feature_names = config.feature_names
+        self.col,   self.exp   = create_experiment(self.data,   self.meta, config.feature_names)
+        self.col_z, self.exp_z = create_experiment(self.data_z, self.meta, config.feature_names)
+
+
+def normalize_to_ctrl_profile(data_z, exp_z, signal_names, ctrl_cond='B50'):
+   
+    # Normalize signals so ctrl radial profile min=0 and max=1
+    signal_min = {s: exp_z.radialProfiles[ctrl_cond][s].min() for s in signal_names}
+    signal_max = {s: exp_z.radialProfiles[ctrl_cond][s].max() for s in signal_names}
+    
+    data_norm = data_z.copy()
+    for s in signal_names:
+        data_norm[s] = (data_z[s] - signal_min[s]) / (signal_max[s] - signal_min[s])
+    
+    return data_norm, signal_min, signal_max
 
 
 #------------------------------------------------------------------------------------------------------------
@@ -214,9 +564,7 @@ def determine_threshold(data, perturbing_sigs, perturb_mode='inh', use_profile=N
         if use_profile:
             return np.min(use_profile.radialProfiles['B50'][perturbing_sigs])
         else:
-            threshold = np.percentile(data[perturbing_sigs], percentile)
-            print(threshold)
-            return threshold
+            return np.percentile(data[perturbing_sigs], percentile)
     elif perturb_mode == 'act':
         if use_profile:
             return np.max(use_profile.radialProfiles['B50'][perturbing_sigs])
@@ -256,7 +604,6 @@ def create_perturbed_data(data, signal_names, perturbing_sigs, threshold, pertur
         data_subset = data[subset_mask]
         data_z_subset = data_z[subset_mask]
         
-        print(f"Perturbation subset: {subset_mask.sum()} / {len(data)} cells ({100*subset_mask.mean():.1f}%)")
         
         # Distance signals
         if distance_signals is None:
@@ -298,8 +645,531 @@ def create_perturbed_data(data, signal_names, perturbing_sigs, threshold, pertur
                     data_perturbed[sig] = data[sig]
                     data_perturbed_z[sig] = data_z[sig]
         
-        return data_perturbed, data_perturbed_z, subset_mask
+        return data_perturbed, data_perturbed_z
 
+
+def run_vib_predictions(data_dir, data_train, data_test, signal_names, gene_names, 
+                       hyperparam, N_run = 3, output_prefix='vib_pred'):
+    
+    feat_names = signal_names
+    vib = {}
+    predictions = {}
+
+    feat_train = data_train[feat_names]
+    tar_train = data_train[gene_names]
+    feat_test = data_test[feat_names]
+    
+    for run in range(N_run):
+        #print(f"  VIB Run {run+1}/{N_run}")
+        start = time.time()
+
+        # set seeds for reproducibility
+        torch.manual_seed(run)
+        np.random.seed(run)
+        if torch.backends.mps.is_available():
+            torch.mps.manual_seed(run)
+    
+        vib[run] = VIB(feat_train, tar_train, hyperparam)
+    
+        if not os.path.exists(data_dir + '/model_' + str(run) + '_' + str(len(signal_names)) + 'D' + '.pth'):
+            print('run VIB')
+            _ = vib[run].train(verbose=False)
+            torch.save(vib[run].model, data_dir + '/model_' + str(run) + '_' + str(len(signal_names)) + 'D' + '.pth')
+        else:
+            print('load VIB')
+            vib[run].model = torch.load(data_dir + '/model_' + str(run) + '_' + str(len(signal_names)) + 'D' + '.pth', map_location=torch.device('cpu'), weights_only=False)
+        
+        # Predict
+        tar_predict = vib[run].predict(feat_test)
+        
+        pred_df = data_test.copy()
+        pred_df.loc[tar_predict.index, tar_predict.columns] = tar_predict
+        predictions[run] = pred_df
+        
+    
+    # Average predictions
+    avg_pred = predictions[0].copy()
+    avg_genes = pd.concat([df[gene_names] for df in predictions.values()]).groupby(level=0).mean()
+    avg_pred[gene_names] = avg_genes
+    predictions['avg'] = avg_pred
+    
+    return vib, avg_pred, predictions
+
+
+def fate_histogram(data_cond, exp_result):
+    n_bins = 20  # adjust this number as needed
+    thresh_boundary = 0.5 # boundaries are half maximum of fate
+    colors = list(colmap_fates.values())
+    fate_names_ordered = list(colmap_fates.keys())
+    N_fates = len(fate_names_ordered)
+        
+    fates, fate_names = return_fates(data_cond, thresh=exp_result.thresh)
+    
+    # bin by radial distance
+    binning = pd.qcut(data_cond['CircleEdgeDist'], q=n_bins, labels=False, duplicates='drop').to_frame(name='r_bin')
+    binning['fate'] = fates
+
+    # get bin centers in microns
+    bin_edges = pd.qcut(data_cond['CircleEdgeDist'], q=n_bins, duplicates='drop', retbins=True)[1]
+    bin_centers = (bin_edges[1:] + bin_edges[:-1]) / 2
+
+    # fate counts per bin
+    fate_counts = binning.groupby(['r_bin', 'fate']).size().unstack(fill_value=0)
+    fate_counts = fate_counts.reindex(columns=fate_names_ordered, fill_value=0)
+
+    # normalize per fate (each fate peaks at 1) for boundary detection
+    fate_counts_byfate = fate_counts.div(fate_counts.sum(axis=0), axis=1)
+    fate_counts_byfate_norm = fate_counts_byfate.div(fate_counts_byfate.max(axis=0).replace(0, 1), axis=1)
+
+    # normalize per bin for bar plot
+    fate_counts_norm = fate_counts.div(fate_counts.sum(axis=1), axis=0)
+    
+    # create the stacked bar graph
+    # distribution bar plot
+    fig, ax = plt.subplots(1, 1, figsize=(4, 3))
+
+    bin_widths = bin_edges[1:] - bin_edges[:-1]
+    bottom = np.zeros(len(bin_centers))
+    for fi, fate in enumerate(fate_names_ordered):
+        if fate not in fate_counts_norm.columns:
+            continue
+        vals = fate_counts_norm[fate].values
+        ax.bar(bin_centers, vals, width=bin_widths, bottom=bottom,
+            color=colors[fi], align='center')
+        bottom += vals
+    ax.set_xticks([bin_centers[0], bin_centers[-1]], labels=['edge', 'center'])
+    ax.set_xlim(bin_edges[0], bin_edges[-1])
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_ylim(0, 1)
+    ax.set_xlabel(None)
+    
+    ax.set_box_aspect(0.3)
+    sw = 2
+    for spine in ax.spines.values():
+        spine.set_linewidth(sw)
+    
+
+    plt.tight_layout()
+
+
+def kde_on_grid(L1s, L2s, L1grid_scaled, L2grid_scaled, data_percentile=1):
+    values      = np.vstack([L1s, L2s])
+    kernel      = sp.stats.gaussian_kde(values)
+    kde_at_data = kernel(values)
+    vmin        = np.percentile(kde_at_data, data_percentile)
+    kde_grid    = kernel(
+        np.vstack([L1grid_scaled.ravel(), L2grid_scaled.ravel()])
+    ).reshape(L1grid_scaled.shape)
+    levels      = np.linspace(vmin, kde_grid.max(), 10)
+    print(f"  {np.sum(kde_at_data >= vmin)/len(L1s)*100:.1f}% inside contours")
+    return kde_grid, levels
+
+
+def run_vib_across_experiments(exp_results_list, train_configs, test_configs,
+                               signal_names, gene_names, hyperparam,
+                               N_run=3, model_path_infix = 'model_across_exp' , output_prefix='vib_across_exp', target_exp_override=None):
+    
+    # VIB predictions across experiments with per-experiment B50 scaling.
+    feat_names     = signal_names
+    vib            = {}
+    
+    # Initialize predictions storage
+    predictions = {
+        (exp_name, cond): {}
+        for exp_name, cond in train_configs + test_configs
+    }
+    
+    # Fitting per-experiment scalers on B50
+    scalers = {}
+    
+    for exp_name, exp_res in exp_results_list.items():
+        data_b50 = exp_res.data[exp_res.data['condition'] == 'B50']
+        
+        scaler_X = StandardScaler()
+        scaler_Y = StandardScaler()
+        scaler_X.fit(data_b50[signal_names])
+        scaler_Y.fit(data_b50[gene_names])
+        
+        scalers[exp_name] = {'X': scaler_X, 'Y': scaler_Y}
+        print(f"  {exp_name}: {len(data_b50)} B50 cells")
+    
+    # Pre-computing z-normalized data
+    feat_z_all = {}  # {(exp_name, cond): feat_z_df}
+    tar_z_all  = {}
+    data_all   = {}  # {(exp_name, cond): raw_df}
+    
+    all_configs = train_configs + test_configs
+    
+    for exp_name, cond in all_configs:
+        exp_res  = exp_results_list[exp_name]
+        data_cond = exp_res.data[exp_res.data['condition'] == cond]
+        
+        feat_z = pd.DataFrame(
+            scalers[exp_name]['X'].transform(data_cond[signal_names]),
+            index=data_cond.index, columns=signal_names
+        )
+        tar_z = pd.DataFrame(
+            scalers[exp_name]['Y'].transform(data_cond[gene_names]),
+            index=data_cond.index, columns=gene_names
+        )
+        
+        feat_z_all[(exp_name, cond)] = feat_z
+        tar_z_all[(exp_name, cond)]  = tar_z
+        data_all[(exp_name, cond)]   = data_cond
+        
+        print(f"  {exp_name} {cond}: {len(data_cond)} cells")
+    
+
+    # Building colony folds for CV
+    colony_folds = {}
+    
+    for exp_name, cond in train_configs:
+        data_cond    = data_all[(exp_name, cond)]
+        colonies     = np.sort(data_cond['Colony'].unique())
+        colony_folds[(exp_name, cond)] = {
+            rank: col for rank, col in enumerate(colonies)
+        }
+        print(f"  {exp_name} {cond}: {colonies}")
+    
+    # n_folds = max colonies across all training configs
+    n_folds = max(len(cf) for cf in colony_folds.values())
+    print(f"  Total folds: {n_folds}")
+    
+    # Start training loop
+    for run in range(N_run):
+        print(f"\n{'='*60}")
+        print(f"Run {run+1}/{N_run}")
+        print(f"{'='*60}")
+        start = time.time()
+        
+        torch.manual_seed(run)
+        np.random.seed(run)
+        
+        vib[run]            = {}
+        
+        # Initialize pred_dfs for all conditions
+        pred_dfs = {
+            (exp_name, cond): data_all[(exp_name, cond)].copy()
+            for exp_name, cond in all_configs
+        }
+        
+        
+
+        # CV on training conditions    
+        for test_rank in range(n_folds):
+            print(f"\n    Fold {test_rank+1}/{n_folds}:")
+            
+            all_feat_z_train = []
+            all_tar_z_train  = []
+            test_sets        = {}
+            
+            for exp_name, cond in train_configs:
+                colony_fold  = colony_folds[(exp_name, cond)]
+                data_cond = data_all[(exp_name, cond)]
+                feat_z    = feat_z_all[(exp_name, cond)]
+                tar_z     = tar_z_all[(exp_name, cond)]
+                
+                if test_rank in colony_fold:
+                    test_col      = colony_fold[test_rank]
+                    test_mask     = data_cond['Colony'] == test_col
+                    train_mask    = data_cond['Colony'] != test_col
+                    excluded_str  = f"excl. col {test_col}"
+                else:
+                    test_mask     = pd.Series(False, index=data_cond.index)
+                    train_mask    = pd.Series(True,  index=data_cond.index)
+                    excluded_str  = "all (rank not present)"
+                
+                # Add to training pool
+                all_feat_z_train.append(feat_z[train_mask])
+                all_tar_z_train.append(tar_z[train_mask])
+                
+                # Store test set
+                if test_mask.any():
+                    test_sets[(exp_name, cond)] = {
+                        'feat_z': feat_z[test_mask],
+                        'data':   data_cond[test_mask]
+                    }
+                
+            
+            # Pool training data
+            feat_train_z = pd.concat(all_feat_z_train, ignore_index=True)
+            tar_train_z  = pd.concat(all_tar_z_train,  ignore_index=True)
+            
+            
+            # Model path
+            model_path = os.path.join(
+                list(exp_results_list.values())[0].exp_dir,
+                f'{model_path_infix}_{run}_rank{test_rank}_{len(feat_names)}D.pth'
+            )
+            
+            # Train VIB with identity scalers (data already z-normalized)
+            vib[run][test_rank] = VIB(feat_train_z, tar_train_z, hyperparam)
+            vib[run][test_rank].scaler_X_run = IdentityScaler(len(signal_names))
+            vib[run][test_rank].scaler_Y_run = IdentityScaler(len(gene_names))
+            vib[run][test_rank].feat_train_z = feat_train_z.values
+            vib[run][test_rank].tar_train_z  = tar_train_z.values
+            
+            if not os.path.exists(model_path):
+                print(f'      Training...', end=' ', flush=True)
+                _ = vib[run][test_rank].train(verbose=False)
+                torch.save(vib[run][test_rank].model, model_path)
+            else:
+                print(f'      Loading...', end=' ', flush=True)
+                vib[run][test_rank].model = torch.load(
+                    model_path, map_location='cpu', weights_only=False
+                )
+            print('done', flush=True)
+            
+            # Predict and encode for test sets
+            for (exp_name, cond), test_set in test_sets.items():
+                feat_test_z = test_set['feat_z']
+                data_test   = test_set['data']
+                
+                # Predict in z-space then inverse transform
+                vib[run][test_rank].model.eval()
+                X_tensor = torch.FloatTensor(feat_test_z.values).to(device)
+                
+                with torch.no_grad():
+                    pred_z, mu_test, _ = vib[run][test_rank].model(X_tensor)
+                
+                # Use override if specified, otherwise use origin experiment
+                inv_exp = target_exp_override if target_exp_override else exp_name
+                
+                pred_raw = pd.DataFrame(
+                    scalers[inv_exp]['Y'].inverse_transform(pred_z.cpu().numpy()),
+                    index=data_test.index, columns=gene_names
+                )
+                pred_dfs[(exp_name, cond)].loc[pred_raw.index, pred_raw.columns] = pred_raw
+        
+
+        # Predicting test conditions, start with pooling training data
+        all_feat_z_full = pd.concat(
+            [feat_z_all[(exp_name, cond)] for exp_name, cond in train_configs],
+            ignore_index=True
+        )
+        all_tar_z_full = pd.concat(
+            [tar_z_all[(exp_name, cond)] for exp_name, cond in train_configs],
+            ignore_index=True
+        )
+        
+        print(f"  Total train: {len(all_feat_z_full)} cells")
+        
+        model_path_full = os.path.join(
+            list(exp_results_list.values())[0].exp_dir,
+            f'{model_path_infix}_{run}_full_{len(feat_names)}D.pth'
+        )
+        
+        vib[run]['full'] = VIB(all_feat_z_full, all_tar_z_full, hyperparam)
+        vib[run]['full'].scaler_X_run = IdentityScaler(len(signal_names))
+        vib[run]['full'].scaler_Y_run = IdentityScaler(len(gene_names))
+        vib[run]['full'].feat_train_z = all_feat_z_full.values
+        vib[run]['full'].tar_train_z  = all_tar_z_full.values
+        
+        if not os.path.exists(model_path_full):
+            print(f'  Training full model...', end=' ', flush=True)
+            _ = vib[run]['full'].train(verbose=False)
+            torch.save(vib[run]['full'].model, model_path_full)
+        else:
+            print(f'  Loading full model...', end=' ', flush=True)
+            vib[run]['full'].model = torch.load(
+                model_path_full, map_location='cpu', weights_only=False
+            )
+        
+        # Predict on all test conditions
+        vib[run]['full'].model.eval()
+        
+        for exp_name, cond in test_configs:
+            print(f"  {exp_name} {cond}...", end=' ', flush=True)
+            
+            feat_test_z = feat_z_all[(exp_name, cond)]
+            data_test   = data_all[(exp_name, cond)]
+            
+            X_tensor = torch.FloatTensor(feat_test_z.values).to(device)
+            
+            with torch.no_grad():
+                pred_z, mu_test, _ = vib[run]['full'].model(X_tensor)
+            
+            inv_exp = target_exp_override if target_exp_override else exp_name
+            
+            pred_raw = pd.DataFrame(
+                scalers[inv_exp]['Y'].inverse_transform(pred_z.cpu().numpy()),
+                index=data_test.index, columns=gene_names
+            )
+            pred_dfs[(exp_name, cond)].loc[pred_raw.index, pred_raw.columns] = pred_raw
+        
+        
+        # Store predictions
+        for key in all_configs:
+            exp_name, cond = key
+            
+            # Store predictions
+            predictions[key][run] = pred_dfs[key]
+            
+            # Save
+            pred_dfs[key].to_csv(
+                os.path.join(exp_results_list[exp_name].exp_dir,
+                             f"{output_prefix}_{exp_name}_{cond}_"
+                             f"{len(feat_names)}D_Nhid{hyperparam['HIDDEN_DIM']}_"
+                             f"run{run}.csv"),
+                index=False
+            )
+        
+        print(f"\n  Time: {time.time() - start:.1f}s")
+    
+    # Averaging predictions
+    avg_preds = {}
+    
+    for key in all_configs:
+        exp_name, cond = key
+        avg              = predictions[key][0].copy()
+        avg[gene_names]  = pd.concat(
+            [predictions[key][run][gene_names] for run in range(N_run)]
+        ).groupby(level=0).mean()
+        predictions[key]['avg'] = avg
+        avg_preds[key]          = avg
+    
+    return vib, avg_preds, predictions, scalers
+
+def compute_latent_position_entropy(vib, data_z, signal_names, gene_names,
+                                     thresh, n_samples=1000, device='cpu'):
+    
+    X_tensor = torch.FloatTensor(data_z[signal_names].values).to(device)
+    
+    vib.model.eval()
+    with torch.no_grad():
+        mu, logvar = vib.model.encode(X_tensor)
+    
+    all_fates = []
+    for _ in range(n_samples):
+        with torch.no_grad():
+            std = torch.exp(0.5 * logvar)
+            z   = mu + torch.randn_like(std) * std
+            Y_z = vib.model.decode(z).cpu().numpy()
+        
+        Y = vib.scaler_Y_run.inverse_transform(Y_z)
+        Y = pd.DataFrame(Y, columns=gene_names, index=data_z.index)
+        
+        fates, _ = return_fates(Y, thresh=thresh)
+        all_fates.append(fates)
+    
+    fate_matrix = pd.DataFrame(
+        {i: f for i, f in enumerate(all_fates)},
+        index=data_z.index
+    )
+    per_cell = fate_matrix.apply(
+        lambda row: stats.entropy(row.value_counts(), base=2), axis=1
+    )
+    
+    return per_cell, mu.cpu().numpy()
+
+
+def plot_colony_pie_triplet(colony_list, exp_result_list, labels,
+                             ms=7, figsize=(5, 5), start_angle=90,
+                             boundary_color='white', boundary_lw=2, dpi=150):
+    """Arrange three colony scatter plots as pie sectors."""
+    import io
+    from matplotlib.patches import Wedge
+
+    sector_starts = [start_angle + i * 120 for i in range(3)]
+    fig, ax       = plt.subplots(figsize=figsize, constrained_layout=True)
+    ax.set_aspect('equal')
+    ax.axis('off')
+
+    for colony, exp_result, s_start in zip(colony_list, exp_result_list, sector_starts):
+
+        # Render colony to buffer
+        fig_tmp, ax_tmp = plt.subplots(figsize=(5, 5), constrained_layout=True)
+        colony.scatter_fates(ms=ms, ax=ax_tmp, legend=False, thresh=exp_result.thresh)
+        buf = io.BytesIO()
+        fig_tmp.savefig(buf, format='png', dpi=dpi, bbox_inches='tight', transparent=True)
+        buf.seek(0)
+        img = plt.imread(buf)
+        plt.close(fig_tmp)
+
+        # Crop whitespace
+        mask         = img[:, :, 3] > 0.01 if img.shape[2] == 4 else ~np.all(img > 0.99, axis=2)
+        rows, cols   = np.any(mask, axis=1), np.any(mask, axis=0)
+        r0, r1       = np.where(rows)[0][[0, -1]]
+        c0, c1       = np.where(cols)[0][[0, -1]]
+        pad          = 5
+        img_cropped  = img[max(0, r0-pad):r1+pad, max(0, c0-pad):c1+pad]
+
+        # Place image clipped to sector wedge
+        wedge = Wedge((0, 0), r=1.0, theta1=s_start, theta2=s_start+120,
+                      transform=ax.transData)
+        im    = ax.imshow(img_cropped, extent=[-1, 1, -1, 1],
+                          aspect='equal', zorder=2, origin='upper')
+        im.set_clip_path(wedge)
+
+    # Sector dividers
+    for angle in sector_starts:
+        rad = np.radians(angle)
+        ax.plot([0, np.cos(rad)], [0, np.sin(rad)],
+                color=boundary_color, linewidth=boundary_lw, zorder=5)
+
+    return fig, ax
+
+def plot_latent_entropy_comparison(latent_entropy_results, condition_data_dict,
+                                    figsize=(8, 5), use_ci=True, n_bootstrap=1000):
+    """Bar plot of latent position entropy with colony-level bootstrap."""
+
+    def get_ci(label):
+        per_cell  = latent_entropy_results[label]['per_cell']
+        data_cond = condition_data_dict.get(label)
+        
+        # Mean entropy per colony
+        colony_means = np.array([
+            per_cell.reindex(data_cond[data_cond['Colony'] == col].index).dropna().mean()
+            for col in data_cond['Colony'].unique()
+        ])
+        colony_means = colony_means[~np.isnan(colony_means)]
+        
+        bootstraps = [np.mean(np.random.choice(colony_means, len(colony_means), replace=True))
+                      for _ in range(n_bootstrap)]
+        
+        return {'mean':     colony_means.mean(),
+                'ci_lower': np.percentile(bootstraps, 2.5),
+                'ci_upper': np.percentile(bootstraps, 97.5)}
+
+    def get_yerr(r):
+        return [[r['mean'] - r['ci_lower']], [r['ci_upper'] - r['mean']]] if use_ci \
+               else [[r['mean'] - r['ci_lower']]]
+
+    def bar(ax, x, label, color, **kwargs):
+        r = ci[label]
+        ax.bar(x, r['mean'], width=bar_width, color=color, alpha=0.8,
+               edgecolor='black', linewidth=1.5,
+               yerr=get_yerr(r), capsize=5,
+               error_kw={'linewidth': 1.5}, **kwargs)
+
+    ci        = {label: get_ci(label) for label in latent_entropy_results}
+    bar_width = 0.25
+    x_pos     = np.arange(4)
+    colors    = {'meas': 'coral', 'naive': '#aa5435', 'knn': '#6b2e1a'}
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # B50 ctrl
+    bar(ax, x_pos[0], 'B50', colors['meas'])
+
+    # Perturbation groups
+    for i, (key, x) in enumerate(zip(['Z2 MEKi', 'Z2 IWP2', 'X7 TRULI'], x_pos[1:])):
+        bar(ax, x - bar_width, key,              colors['meas'])
+        bar(ax, x,             f'{key} (naive)', colors['naive'])
+        bar(ax, x + bar_width, f'{key} (knn)',   colors['knn'])
+
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(['B50', 'MEKi', 'WNTSeci', 'LATSi'], ha='center', fontsize=16)
+    ax.tick_params(axis='y', labelsize=14)
+    ax.set_ylabel('prediction entropy', fontsize=16)
+    ax.legend(handles=[
+        mpatches.Patch(facecolor=c, edgecolor='black', linewidth=1.5, label=l)
+        for c, l in zip(colors.values(), ['measured', 'naive', 'projected'])
+    ], fontsize=15)
+
+    plt.tight_layout()
+    return fig, ax
 #------------------------------------------------------------------------------------------------------------
 # ANALYSIS: INFORMATION
 #------------------------------------------------------------------------------------------------------------
@@ -346,7 +1216,7 @@ def getPreds2(data, dataDir, signal_combinations, gene_names, hyperparam, N_run=
 
         sig_str = '_'.join(sorted(signals))
 
-        fname = dataDir + '/Fig3_VIB_' + sig_str + '_B50predonly.csv'
+        fname = dataDir + '/Fig3_VIB/Fig3_VIB_' + sig_str + '_B50predonly.csv'
         
         if os.path.exists(fname):
             print(f'loading: {fname}')
@@ -462,7 +1332,7 @@ def plotCumulativeMI(data, cond, dataDir, markergenes, signals, signames_simple,
         perm = [signals.index(item) for item in signals_ordered]
         labels = [signames_simple[i] for i in perm]
         
-        fig,ax = plt.subplots(1,1, figsize=(4,4.4))
+        fig,ax = plt.subplots(1,1, figsize=(4,5))
         
         if title:
             plt.title(fatemarker,fontsize=26, pad=10, fontweight='bold',color = [0, 0.8, 0.8], path_effects=[pe.withStroke(linewidth=1, foreground="black")])
@@ -541,11 +1411,22 @@ def plotCumulativeMI(data, cond, dataDir, markergenes, signals, signames_simple,
         #plt.tight_layout()
         
         #plt.tight_layout(pad=0)
+
+        # Save core fate markers in Fig3, and the rest in FigS4
         
-        if checkoverfit:
-            fname = dataDir + '/cumulativeMI_' + fatemarker + '_' + cond + '_' + str(len(signals)) + 'D' + '_train.png'
+        if fatemarker in ['ISL1', 'TFAP2C', 'SOX17', 'TBXT', 'TBX6', 'NANOG', 'SOX2']:
+            print(fatemarker + " core")
+            file_prefix = 'Fig3'
+
+        elif fatemarker in ['L', 'g1', 'g2']:
+            file_prefix = 'FigS6'
         else:
-            fname = dataDir + '/cumulativeMI_' + fatemarker + '_' + cond + '_' + str(len(signals)) + 'D' + '.png'
+            file_prefix = 'FigS4'
+            
+        if checkoverfit:
+            fname = file_prefix + '/cumulativeMI_' + fatemarker + '_' + cond + '_' + str(len(signals)) + 'D' + '_train.png'
+        else:
+            fname = file_prefix  + '/cumulativeMI_' + fatemarker + '_' + cond + '_' + str(len(signals)) + 'D' + '.png'
         plt.savefig(fname)
         
 def getmaxDecoderMI(genelist, signal_names, pred, data, debug=False):
@@ -692,7 +1573,7 @@ def plotRedundantMI(dataDir, data, cond, markergenes, signals, N_run, hyperparam
     plt.gca().invert_yaxis()
     plt.tight_layout()
     
-    fname = dataDir + '/MI_redundancy_' + str(len(signals)) + 'D.png'
+    fname = 'FigS4/MI_redundancy_' + str(len(signals)) + 'D.png'
     plt.savefig(fname)
     
     
@@ -716,7 +1597,7 @@ def plotRedundantMI(dataDir, data, cond, markergenes, signals, N_run, hyperparam
     plt.gca().invert_yaxis()
     plt.tight_layout()
     
-    fname = dataDir + '/MI_redundancyratio_' + str(len(signals)) + 'D.png'
+    fname = 'FigS4/MI_redundancyratio_' + str(len(signals)) + 'D.png'
     plt.savefig(fname)
     #plt.legend()
 
@@ -849,8 +1730,10 @@ def plotMIgraph(dataDir, data, cond, signames, markernames, signames_clean=None,
         prefix = '_sig2sig_and' + prefix
     if rotate:
         prefix = prefix + 'rotated_'
-    
-    plt.savefig(dataDir + "/" + 'MI' + prefix + cond + file_suffix, bbox_inches='tight')
+    if signames == ['s1','s2']:
+        plt.savefig("FigS6/" + 'MI' + prefix + cond + file_suffix, bbox_inches='tight')
+    else:
+        plt.savefig("Fig3/" + 'MI' + prefix + cond + file_suffix, bbox_inches='tight')
     
     return MI, MIsigs
 
@@ -1178,6 +2061,28 @@ class VIB:
                       f'Recon: {recon_loss.item():.4f}, KL: {kl_loss.item():.4f}')
         
         return recon_losses
+
+from sklearn.preprocessing import FunctionTransformer
+
+class IdentityScaler:
+    """Scaler that does nothing - for use when data is already normalized"""
+    def __init__(self, n_features):
+        self.mean_   = np.zeros(n_features)
+        self.scale_  = np.ones(n_features)
+        self.var_    = np.ones(n_features)
+        self.n_features_in_ = n_features
+    
+    def transform(self, X):
+        return np.array(X)
+    
+    def inverse_transform(self, X):
+        return np.array(X)
+    
+    def fit(self, X):
+        return self
+    
+    def fit_transform(self, X):
+        return np.array(X)
 
 class Metadata: 
 
