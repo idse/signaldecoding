@@ -58,10 +58,12 @@ class FlexibleVIB(nn.Module):
             return self.enc_mu(x), self.enc_logvar(x)
     
     def reparameterize(self, mu, logvar):
+        if not self.training:
+            return mu
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
-    
+
     def decode(self, z):
         if self.decoder_type == 'nonlinear':
             h = z
@@ -72,7 +74,7 @@ class FlexibleVIB(nn.Module):
             return h
         else:
             return self.dec_out(z)
-    
+
     def forward(self, x):
         mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
@@ -123,10 +125,12 @@ class FlexibleVAE(nn.Module):
             return self.enc_mu(x), self.enc_logvar(x)
     
     def reparameterize(self, mu, logvar):
+        if not self.training:
+            return mu
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
-    
+
     def decode(self, z):
         if self.decoder_type == 'nonlinear':
             h = z
@@ -137,7 +141,7 @@ class FlexibleVAE(nn.Module):
             return h
         else:
             return self.dec_out(z)
-    
+
     def forward(self, x):
         mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)

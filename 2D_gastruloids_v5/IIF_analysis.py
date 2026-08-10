@@ -1767,6 +1767,17 @@ def return_fates(data, thresh=1):
     NANOG_scaled = data['NANOG']/thresh['NANOG']
     SOX2_scaled = data['SOX2']/thresh['SOX2']
 
+
+    # PGCLC = TFAP2C & SOX17 
+    # #AMLC = (ISL1 | TFAP2C) & ~PGCLC
+    # #endo = SOX17 & ~PGCLC
+    # meso = TBXT & TBX6 & ~PGCLC #& ~endo
+    # AMLC = ISL1 & ~PGCLC & ~meso # & ~endo  
+    # PSLC = TBXT & ~PGCLC & ~meso & ~AMLC  #& ~endo # (data['TBXT'] > 100)
+    # pluri = NANOG & SOX2 & ~PGCLC & ~meso & ~AMLC & ~PSLC  # & ~endo 
+    # ecto = ~NANOG & SOX2 & ~PGCLC & ~meso & ~AMLC &~pluri &~PSLC #  & ~endo 
+    # other = ~(ecto | pluri | PSLC | AMLC | meso | PGCLC) #  | endo
+
     PGCLC = TFAP2C & SOX17 
     #endo = SOX17 & ~PGCLC
     meso = TBXT & TBX6 & ~PGCLC #& ~endo
@@ -2033,33 +2044,14 @@ class VIB:
         X_train_run = torch.FloatTensor(self.feat_train_z).to(device)
         Y_train_run = torch.FloatTensor(self.tar_train_z).to(device)
 
-        epochs=self.hyperparam['EPOCHS']
-        lr=self.hyperparam['LEARNING_RATE']
-        beta=self.hyperparam['BETA']
-        
-        optimizer = optim.Adam(self.model.parameters(), lr=lr)
+        recon_losses = fns_NN.train_model(
+            self.model, X_train_run, Y_train_run, is_vae=False,
+            epochs=self.hyperparam['EPOCHS'],
+            lr=self.hyperparam['LEARNING_RATE'],
+            beta=self.hyperparam['BETA'],
+            verbose=verbose, print_every=print_every,
+        )
 
-        recon_losses = []
-    
-        for epoch in range(epochs):
-            
-            optimizer.zero_grad()
-            recon, mu, logvar = self.model(X_train_run)
-            target = Y_train_run
-            
-            recon_loss = torch.nn.MSELoss()(recon, target)
-            kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / target.size(0)
-            loss = recon_loss + beta * kl_loss
-
-            loss.backward()
-            optimizer.step()
-            
-            recon_losses.append(recon_loss.item())
-            
-            if verbose and (epoch + 1) % print_every == 0:
-                print(f'  Epoch {epoch+1}/{epochs}, Loss: {loss.item():.4f}, '
-                      f'Recon: {recon_loss.item():.4f}, KL: {kl_loss.item():.4f}')
-        
         return recon_losses
 
 from sklearn.preprocessing import FunctionTransformer
