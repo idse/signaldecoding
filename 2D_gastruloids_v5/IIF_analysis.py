@@ -677,7 +677,7 @@ def run_vib_predictions(data_dir, data_train, data_test, signal_names, gene_name
             torch.save(vib[run].model, data_dir + '/model_' + str(run) + '_' + str(len(signal_names)) + 'D' + '.pth')
         else:
             print('load VIB')
-            vib[run].model = torch.load(data_dir + '/model_' + str(run) + '_' + str(len(signal_names)) + 'D' + '.pth', map_location=torch.device('cpu'), weights_only=False)
+            vib[run].model = torch.load(data_dir + '/model_' + str(run) + '_' + str(len(signal_names)) + 'D' + '.pth', map_location=device, weights_only=False)
         
         # Predict
         tar_predict = vib[run].predict(feat_test)
@@ -917,7 +917,7 @@ def run_vib_across_experiments(exp_results_list, train_configs, test_configs,
             else:
                 print(f'      Loading...', end=' ', flush=True)
                 vib[run][test_rank].model = torch.load(
-                    model_path, map_location='cpu', weights_only=False
+                    model_path, map_location=device, weights_only=False
                 )
             print('done', flush=True)
             
@@ -973,7 +973,7 @@ def run_vib_across_experiments(exp_results_list, train_configs, test_configs,
         else:
             print(f'  Loading full model...', end=' ', flush=True)
             vib[run]['full'].model = torch.load(
-                model_path_full, map_location='cpu', weights_only=False
+                model_path_full, map_location=device, weights_only=False
             )
         
         # Predict on all test conditions
