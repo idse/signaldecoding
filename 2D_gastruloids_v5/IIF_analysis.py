@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import scipy as sp
 import scipy.interpolate as interp
 from scipy.ndimage import gaussian_filter1d
