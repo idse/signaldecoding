@@ -125,37 +125,9 @@ def adjust_contrast(im, tol):
     im_rescale = exposure.rescale_intensity(im, in_range=(Imin,Imax),out_range=(0,255))
     return(im_rescale)
 
-def makeRGBoverlay_v1(coli, markers, dataDir, rdStr='RD', Ilim=None):
-    
-    MIPca = {}
-
-    for i, m in zip(range(0,len(markers)), markers):
-
-        fname = getImageFilename(coli, m, dataDir, rdStr) 
-        print('loading', fname)
-        MIP = imio.imread(fname)
-        if Ilim==None:
-            Imin, Imax = np.percentile(MIP[MIP>0], tol[m])
-        else:
-            Imin, Imax = Ilim[m]        
-        MIPca[m] = exposure.rescale_intensity(MIP, in_range=(Imin,Imax),out_range=(0,255))
-
-    
-    if len(markers)==3:
-        RGBoverlay = np.stack([MIPca[markers[0]], MIPca[markers[1]], MIPca[markers[2]]], axis = 2)
-    elif len(markers)==2:
-        RGBoverlay = np.stack([MIPca[markers[0]], MIPca[markers[1]], 0*MIPca[markers[0]]], axis = 2)
-    else: 
-        RGBoverlay = MIPca[markers[0]];
-        
-    RGBoverlay=RGBoverlay.astype(np.uint8)
-        
-    return RGBoverlay
-
-
 
 def makeRGBbase(col, coli, markers, dataDir, crop_margin, center_x_margin, center_y_margin,
-                rdStr='Rd', Ilim=None, percentiles=None,
+                rdStr='Rd', Ilim=None, percentiles=None, tol=None,
                 partial_MIP=False, starting_slice=6, stack_length=5, pie_sectors=False,
                 grayscale_background=False, outer_margin=50, boundary_width=7):
     """Build and return the base RGB composite."""
@@ -173,7 +145,7 @@ def makeRGBbase(col, coli, markers, dataDir, crop_margin, center_x_margin, cente
         elif percentiles is not None and mrkr in percentiles:
             lo, hi = np.percentile(MIP[MIP > 0], percentiles[mrkr])
         else:
-            lo, hi = np.percentile(MIP[MIP > 0], tol.get(mrkr, [1, 99]))
+            lo, hi = np.percentile(MIP[MIP > 0], (tol or {}).get(mrkr, [1, 99]))
         return float(lo), float(hi)
 
     def rescale(MIP, mrkr):
@@ -244,7 +216,7 @@ def makeRGBbase(col, coli, markers, dataDir, crop_margin, center_x_margin, cente
                 grayscale_background=grayscale_background,
                 center=center, pad=pad, h=h, w=w,
                 dataDir=dataDir, coli=coli, rdStr=rdStr,
-                Ilim=Ilim, percentiles=percentiles)
+                Ilim=Ilim, percentiles=percentiles, tol=tol)
     return RGBbase, meta
 
 
@@ -252,13 +224,13 @@ def applyOverlay(RGBbase, meta, overlay_marker, overlay_alpha=1):
     """Apply a single overlay channel to a prebuilt base image."""
 
     def get_Ilimits(MIP, mrkr):
-        Ilim, percentiles = meta['Ilim'], meta['percentiles']
+        Ilim, percentiles, tol = meta['Ilim'], meta['percentiles'], meta.get('tol')
         if Ilim is not None and mrkr in Ilim:
             lo, hi = Ilim[mrkr]
         elif percentiles is not None and mrkr in percentiles:
             lo, hi = np.percentile(MIP[MIP > 0], percentiles[mrkr])
         else:
-            lo, hi = np.percentile(MIP[MIP > 0], tol.get(mrkr, [1, 99]))
+            lo, hi = np.percentile(MIP[MIP > 0], (tol or {}).get(mrkr, [1, 99]))
         return float(lo), float(hi)
 
     radius               = meta['radius']
@@ -1927,6 +1899,40 @@ def calcPerformance(data, pred_subs, thresh, gene_names):
         performances[cond]=performance
         
     return performances, recall_dict
+
+def save_df_as_image(df, filepath, col_width=1.7, row_height=0.4, fontsize=10,
+                      header_color='#e8e8e8', row_alt_color='#f5f5f5'):
+    n_rows, n_cols = df.shape
+    fig, ax = plt.subplots(figsize=(col_width * (n_cols + 1), row_height * (n_rows + 1)))
+    ax.axis('off')
+
+    table = ax.table(cellText=df.values, rowLabels=df.index, colLabels=df.columns,
+                      cellLoc='right', rowLoc='right', colLoc='right', loc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(fontsize)
+    table.scale(1, 1.6)
+
+    for (row, col), cell in table.get_celld().items():
+        cell.set_edgecolor('none')   # leave visible_edges at its default ('closed') -- restricting
+                                       # it to just 'B' leaves the cell's path open and silently
+                                       # kills the facecolor fill, even though it's set correctly
+        if row == 0:
+            cell.set_facecolor(header_color)
+            cell.set_text_props(weight='bold')
+        else:
+            cell.set_facecolor(row_alt_color if row % 2 == 0 else 'white')
+
+    # draw the rule under the header as its own line, using the header cell's actual rendered
+    # position, rather than relying on the cell's own (fill-breaking) border
+    fig.canvas.draw()
+    header_cell = table[0, 0]
+    bbox = header_cell.get_window_extent(fig.canvas.get_renderer())
+    y_bottom = ax.transAxes.inverted().transform((0, bbox.y0))[1]
+    ax.axhline(y=y_bottom, xmin=0.02, xmax=0.98, color='black', linewidth=1.2, clip_on=False)
+
+    plt.tight_layout()
+    plt.savefig(filepath, bbox_inches='tight', dpi=200)
+    plt.close(fig)
     
 def sig2fate(data, signals, gene_names, N_run, hyperparam):
     # returns average prediction for N_runs from list of signals
