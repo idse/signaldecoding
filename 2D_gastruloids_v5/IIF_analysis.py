@@ -1907,30 +1907,38 @@ def save_df_as_image(df, filepath, col_width=1.7, row_height=0.4, fontsize=10,
     ax.axis('off')
 
     table = ax.table(cellText=df.values, rowLabels=df.index, colLabels=df.columns,
-                      cellLoc='right', rowLoc='right', colLoc='right', loc='center')
+                      cellLoc='right', rowLoc='right', loc='center')
     table.auto_set_font_size(False)
     table.set_fontsize(fontsize)
     table.scale(1, 1.6)
 
     for (row, col), cell in table.get_celld().items():
-        cell.set_edgecolor('none')   # leave visible_edges at its default ('closed') -- restricting
-                                       # it to just 'B' leaves the cell's path open and silently
-                                       # kills the facecolor fill, even though it's set correctly
+        cell.set_edgecolor('none')
         if row == 0:
             cell.set_facecolor(header_color)
             cell.set_text_props(weight='bold')
         else:
             cell.set_facecolor(row_alt_color if row % 2 == 0 else 'white')
 
-    # draw the rule under the header as its own line, using the header cell's actual rendered
-    # position, rather than relying on the cell's own (fill-breaking) border
-    fig.canvas.draw()
-    header_cell = table[0, 0]
-    bbox = header_cell.get_window_extent(fig.canvas.get_renderer())
-    y_bottom = ax.transAxes.inverted().transform((0, bbox.y0))[1]
-    ax.axhline(y=y_bottom, xmin=0.02, xmax=0.98, color='black', linewidth=1.2, clip_on=False)
-
     plt.tight_layout()
+
+    # position the header-separator line in FIGURE coordinates, not axes coordinates --
+    # the table can overflow its axes' bbox (table.scale stretches rows independently of
+    # the axes size), so ax.transAxes doesn't reliably map to the table's true footprint
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    header_cell = table[0, 0]
+    y_fig = header_cell.get_window_extent(renderer).transformed(fig.transFigure.inverted()).y0
+    x0_fig = table[0, 0].get_window_extent(renderer).x0
+    x1_fig = table[0, n_cols - 1].get_window_extent(renderer).x1
+    x0_fig, _ = fig.transFigure.inverted().transform((x0_fig, 0))
+    x1_fig, _ = fig.transFigure.inverted().transform((x1_fig, 0))
+
+    import matplotlib.lines as mlines
+    line = mlines.Line2D([x0_fig, x1_fig], [y_fig, y_fig], color='black', linewidth=1.2,
+                          transform=fig.transFigure, clip_on=False)
+    fig.add_artist(line)
+
     plt.savefig(filepath, bbox_inches='tight', dpi=200)
     plt.close(fig)
     
