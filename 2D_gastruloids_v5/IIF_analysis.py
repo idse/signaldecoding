@@ -1,3 +1,4 @@
+import concurrent.futures
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -1274,32 +1275,225 @@ def plot_latent_entropy_comparison(latent_entropy_results, condition_data_dict,
 import matplotlib.patheffects as pe
 from matplotlib.patches import Arc
 
-def getPreds(data, cond, dataDir, signal_chains, fatemarker, gene_names, hyperparam, N_run, save=True):
+# Tracks (pred_cache_dir, cond, sorted-signal-names-string) keys that getPreds has already
+# force-recomputed once in this kernel session, so recompute=True forces a fresh retrain
+# only the first time each signal combination is requested, not every time -- see
+# getPreds's docstring. Lives at module level, not inside getPreds, so it persists across
+# separate getPreds calls (e.g. once per marker/round in plotCumulativeMI's loop) within
+# the same kernel session, but resets on a kernel restart.
+_getPreds_recomputed_this_session = set()
 
-    mean_preds = {}
-    mean_train_preds = {} # predictions on training data to check for overfitting
+def _sig2fate_and_save_avg(data_cond, feat_names, gene_names, N_run, hyperparam, fname):
+    """Worker for getPreds's parallel path: trains N_run seeds for one signal combination
+    via sig2fate, averages them, and writes the averaged prediction directly to disk,
+    returning only a lightweight confirmation rather than the DataFrame -- avoids pickling
+    large results back through a process pool. Must be a module-level function (not a
+    closure), since ProcessPoolExecutor needs it importable/picklable under Python's
+    default 'spawn' start method (used on macOS). Not called directly -- see getPreds.
+    sig2fate's second return value (its own-data / in-sample prediction, for an
+    overfitting check that was never actually implemented -- see sig2fate's docstring) is
+    discarded here rather than also saved, since nothing reads it; see checkoverfit in
+    plotCumulativeMI."""
+    mean_pred, _ = sig2fate(data_cond, list(feat_names), gene_names, N_run, hyperparam)
+    mean_pred.to_csv(fname)
+    return tuple(feat_names)
+
+
+def getPreds(data, cond, dataDir, signal_chains, fatemarker, gene_names, hyperparam, N_run, save=True, recompute=False, pred_cache_dir=None, max_workers=1):
+    """Leave-one-colony-out CV predictions (via sig2fate) for each signal combination in
+    signal_chains, cached keyed by (cond, sorted signal names) -- shared across whichever
+    fatemarker/gene_names request them, since sig2fate predicts all gene_names at once
+    regardless of which single marker a caller is currently interested in.
+    recompute=True forces retraining the FIRST time a given signal combination is
+    requested in this kernel session (e.g. right after a fix to sig2fate, since a stale
+    cache is otherwise loaded silently); once retrained, later requests for that SAME
+    combination -- from a later round, or a different marker's greedy path, both common
+    since this cache is shared across markers -- reuse that now-fresh result instead of
+    retraining it again, even though recompute is still True. Tracked in-memory via
+    _getPreds_recomputed_this_session, a module-level set, so this doesn't persist across
+    kernel restarts (a fresh kernel starts with an empty set, so recompute=True will force
+    a real retrain again the first time each combination is requested in the new session).
+    pred_cache_dir: directory for the prediction cache; defaults to dataDir if not given.
+    Kept separate from dataDir (rather than just repointing dataDir itself) so the cache
+    location can be overridden -- e.g. to a subdirectory holding only known-fresh results
+    after a sig2fate fix, to avoid silently trusting pre-fix cache files sitting alongside
+    them -- without disturbing dataDir's other uses (e.g. figure output paths). signal_chains
+    entries are grouped by their CANONICAL (sorted) signal set before anything is trained --
+    the cache filename depends only on the sorted names, so two entries that are the same
+    signals in a different order resolve to the same files and must be trained exactly
+    once, not once each (see getPredsPerSeed's docstring for why this specifically matters
+    under max_workers>1: submitting more than one differently-ordered duplicate as separate
+    concurrent jobs would have them all write to the same files at once, corrupting the
+    cache -- not just wasteful, actively unsafe). max_workers: if >1, missing combinations
+    are trained concurrently across that many worker processes via ProcessPoolExecutor.
+    WARNING (confirmed empirically 251217, on an Apple Silicon/MPS machine): concurrent
+    multi-process training on MPS genuinely does speed things up -- but it also silently
+    produces DIFFERENT (and apparently worse) trained models than sequential training of
+    the exact same combination with the exact same seeds, which is what makes it
+    dangerous rather than merely unhelpful. E.g. one combination's decoder MI came out as
+    0.785 trained under max_workers=8 versus a reproducible (bit-identical across
+    repeats) 0.864 trained sequentially (max_workers=1) for the identical signals/marker/
+    N_run. Sequential (single-process) training was independently confirmed
+    deterministic: repeated from-scratch retrains of the same combination gave
+    bit-identical results. So on MPS, max_workers>1 trades correctness for speed, not a
+    free performance win -- leave it at 1 unless training on CPU (where ordinary
+    multi-process parallelism has no such contention issue) or unless this has been
+    re-verified on the machine in question."""
+
+    if pred_cache_dir is None:
+        pred_cache_dir = dataDir
+    os.makedirs(pred_cache_dir, exist_ok=True)
 
     data_cond = data[data['condition']==cond]
-    
+
+    groups = {}  # feat_name_str -> {'tuples': [orig orderings], 'fname': ...}
     for feat_names in signal_chains:
-
         feat_name_str = '_'.join(sorted(feat_names, key=str.lower))
-        fname = dataDir + '/251115_VIB_' + str(len(feat_names)) + 'D_'+cond+'_' + feat_name_str + '_avg.csv'
-        fname_train = dataDir + '/251115_VIB_' + str(len(feat_names)) + 'D_'+cond+'_' + feat_name_str + '_train_avg.csv'
-        
-        print(fname)
-        if os.path.exists(fname) and os.path.exists(fname_train):
-            #print('reading:'+fname)
-            mean_preds[tuple(feat_names)] = pd.read_csv(fname, index_col=0)
-            mean_train_preds[tuple(feat_names)] = pd.read_csv(fname_train, index_col=0)
-        else:
-            print('running: '+str(feat_names))
-            mean_preds[tuple(feat_names)], mean_train_preds[tuple(feat_names)] = sig2fate(data_cond, list(feat_names),  gene_names, N_run, hyperparam)
-            if save:
-                mean_preds[tuple(feat_names)].to_csv(fname)
-                mean_train_preds[tuple(feat_names)].to_csv(fname_train)
+        if feat_name_str not in groups:
+            fname = pred_cache_dir + '/251115_VIB_' + str(len(feat_names)) + 'D_'+cond+'_' + feat_name_str + '_avg.csv'
+            groups[feat_name_str] = {'tuples': [], 'fname': fname}
+        groups[feat_name_str]['tuples'].append(tuple(feat_names))
 
-    return mean_preds, mean_train_preds
+    mean_preds = {}
+    to_train = []  # (representative_feat_names, fname, feat_name_str)
+
+    for feat_name_str, group in groups.items():
+        cache_key = (pred_cache_dir, cond, feat_name_str)
+        fname = group['fname']
+        force_this = recompute and cache_key not in _getPreds_recomputed_this_session
+        print(fname)
+        if not force_this and os.path.exists(fname):
+            pred_df = pd.read_csv(fname, index_col=0)
+            for t in group['tuples']:
+                mean_preds[t] = pred_df
+        else:
+            to_train.append((group['tuples'][0], fname, feat_name_str))
+            _getPreds_recomputed_this_session.add(cache_key)
+
+    if to_train:
+        if max_workers > 1:
+            if not save:
+                raise ValueError("save=False is not supported with max_workers>1 -- the "
+                                  "parallel path communicates results back via the cache "
+                                  "files it writes, so saving can't be skipped.")
+            print(f'training {len(to_train)} combination(s), {max_workers} workers in parallel')
+            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(_sig2fate_and_save_avg, data_cond, feat_names, gene_names, N_run, hyperparam, fname)
+                           for feat_names, fname, _ in to_train]
+                for future in concurrent.futures.as_completed(futures):
+                    print('done:', future.result())
+            for feat_names, fname, feat_name_str in to_train:
+                pred_df = pd.read_csv(fname, index_col=0)
+                for t in groups[feat_name_str]['tuples']:
+                    mean_preds[t] = pred_df
+        else:
+            for feat_names, fname, feat_name_str in to_train:
+                print('running: '+str(feat_names))
+                pred_df, _ = sig2fate(data_cond, list(feat_names), gene_names, N_run, hyperparam)
+                if save:
+                    pred_df.to_csv(fname)
+                for t in groups[feat_name_str]['tuples']:
+                    mean_preds[t] = pred_df
+
+    # mean_train_preds is always None -- an in-sample ("training") prediction was never
+    # actually implemented (see sig2fate's docstring); the second tuple element is kept so
+    # existing callers that unpack (mean_preds, mean_train_preds) don't break, but anything
+    # that actually tries to USE it should fail loudly (see checkoverfit in
+    # plotCumulativeMI) rather than silently getting back a copy of mean_preds.
+    return mean_preds, None
+
+
+def _sig2fate_and_save_per_seed(data_cond, feat_names, gene_names, N_run, hyperparam, seed_fnames):
+    """Worker for getPredsPerSeed's parallel path: trains all N_run seeds for one signal
+    combination via sig2fate(..., return_per_seed=True) and writes each seed's prediction
+    CSV directly to disk at the given paths, returning only a lightweight confirmation
+    (the combination itself) rather than the DataFrames -- avoids pickling large results
+    back through a process pool. Must be a module-level function (not a closure), since
+    ProcessPoolExecutor needs it importable/picklable under Python's default 'spawn' start
+    method (used on macOS). Not called directly -- see getPredsPerSeed."""
+    _, _, seed_preds = sig2fate(data_cond, list(feat_names), gene_names, N_run, hyperparam, return_per_seed=True)
+    for it, df in seed_preds.items():
+        df.to_csv(seed_fnames[it])
+    return tuple(feat_names)
+
+
+def getPredsPerSeed(data, cond, dataDir, signal_chains, gene_names, hyperparam, N_run,
+                     pred_cache_dir=None, recompute=False, max_workers=1):
+    """Like getPreds, but returns each individual seed's held-out predictions separately
+    instead of averaging them: {tuple(feat_names): {seed_index: prediction_df}}. Used to
+    assess how much an ensemble-averaged result (as getPreds/sig2fate normally return)
+    depends on the specific seeds versus reflecting genuine signal -- getPreds/sig2fate
+    never retain the individual seeds, only their average, so this always requires
+    training (there is nothing to load a per-seed result from the first time). Cached one
+    CSV per seed (suffixed _run{it}, alongside getPreds's own _avg files in the
+    same pred_cache_dir) so a repeated request for the same combination doesn't retrain.
+    recompute=True forces retraining the first time a given combination is requested in
+    this kernel session (same semantics/tracking as getPreds, via the same module-level
+    _getPreds_recomputed_this_session set). signal_chains entries are grouped by their
+    CANONICAL (sorted) signal set before anything is trained -- the cache filename, like
+    getPreds's, depends only on the sorted names, so two entries that are the same
+    signals in a different order (e.g. from two different markers' greedy paths reaching
+    the same combination via a different route) resolve to the same files and must be
+    trained exactly once, not once each; every original ordering is still populated in the
+    returned dict, just pointing at the same underlying result. (An earlier version of
+    this function skipped this grouping and submitted every ordering as its own job --
+    under max_workers>1 that meant multiple processes writing the same files at the same
+    time, corrupting the cache; this is why the grouping matters, not just efficiency.)
+    max_workers: if >1, missing combinations are trained concurrently across that many
+    worker processes via ProcessPoolExecutor, one per canonical group. WARNING: on MPS,
+    max_workers>1 is a CORRECTNESS hazard, not just a performance tradeoff -- confirmed
+    empirically to silently produce different (worse) trained models than sequential
+    training of the identical combination/seeds; see getPreds's docstring for the specific
+    numbers. Leave at 1 unless training on CPU or this has been re-verified."""
+
+    if pred_cache_dir is None:
+        pred_cache_dir = dataDir
+    os.makedirs(pred_cache_dir, exist_ok=True)
+
+    data_cond = data[data['condition']==cond]
+
+    groups = {}  # feat_name_str -> {'tuples': [orig orderings], 'seed_fnames': [...]}
+    for feat_names in signal_chains:
+        feat_name_str = '_'.join(sorted(feat_names, key=str.lower))
+        if feat_name_str not in groups:
+            seed_fnames = [pred_cache_dir + '/251115_VIB_' + str(len(feat_names)) + 'D_'+cond+'_' + feat_name_str + f'_run{it}.csv' for it in range(N_run)]
+            groups[feat_name_str] = {'tuples': [], 'seed_fnames': seed_fnames}
+        groups[feat_name_str]['tuples'].append(tuple(feat_names))
+
+    per_seed_preds = {}
+    to_train = []  # (representative_feat_names, seed_fnames, feat_name_str)
+
+    for feat_name_str, group in groups.items():
+        cache_key = (pred_cache_dir, cond, feat_name_str, 'per_seed')
+        seed_fnames = group['seed_fnames']
+        force_this = recompute and cache_key not in _getPreds_recomputed_this_session
+        if not force_this and all(os.path.exists(f) for f in seed_fnames):
+            preds_this = {it: pd.read_csv(seed_fnames[it], index_col=0) for it in range(N_run)}
+            for t in group['tuples']:
+                per_seed_preds[t] = preds_this
+        else:
+            to_train.append((group['tuples'][0], seed_fnames, feat_name_str))
+            _getPreds_recomputed_this_session.add(cache_key)
+
+    if to_train:
+        if max_workers > 1:
+            print(f'training {len(to_train)} combination(s) per-seed, {max_workers} workers in parallel')
+            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(_sig2fate_and_save_per_seed, data_cond, feat_names, gene_names, N_run, hyperparam, seed_fnames)
+                           for feat_names, seed_fnames, _ in to_train]
+                for future in concurrent.futures.as_completed(futures):
+                    print('done:', future.result())
+        else:
+            for feat_names, seed_fnames, _ in to_train:
+                print('running per-seed:', feat_names)
+                _sig2fate_and_save_per_seed(data_cond, feat_names, gene_names, N_run, hyperparam, seed_fnames)
+
+        for feat_names, seed_fnames, feat_name_str in to_train:
+            preds_this = {it: pd.read_csv(seed_fnames[it], index_col=0) for it in range(N_run)}
+            for t in groups[feat_name_str]['tuples']:
+                per_seed_preds[t] = preds_this
+
+    return per_seed_preds
 
 # i can probably merge this with getPreds - do later when there is time
 
@@ -1386,131 +1580,216 @@ def col_meanstd(MI_dec):
         MI_dec_std[gene] = MI_dec[gene].std(axis=1, ddof=1)  # Std across colonies
 
     return MI_dec_mean, MI_dec_std
-    
-def plotCumulativeMI(data, cond, dataDir, markergenes, signals, signames_simple, N_run, hyperparam, plotparam=None, uniqueMI=None, checkoverfit=False, title=True):
 
-    # signals must be subset of global signal_names
-    # also get the simplified names corresponding to this subset
-    # index = [signal_names.index(item) for item in signals]
-    # if not signames_simple: signames_simple = [signal_names_simplified[i] for i in index]
+def plotCumulativeMI(data, cond, dataDir, markergenes, signals, signames_simple, N_run, hyperparam, plotparam=None, uniqueMI=None, checkoverfit=False, title=True, show_margin_line=True, exhaustive_best=None, recompute=False, pred_cache_dir=None, max_workers=1):
+    """Greedy cumulative-MI bar chart per fate marker, plus the saturation point (smallest
+    signal-subset size k whose decoding MI is statistically non-inferior to the
+    all-signals MI, within a 5% margin). MI_max is the ALL-SIGNALS round's mean decoder MI
+    (not the empirically highest-scoring round, which is upward-biased since it's selected
+    on the data, and would understate every r_k) -- the empirically-highest round's MI and
+    its k are still computed and reported separately, as a diagnostic for whether adding
+    the last signal(s) actually degrades the decoder. Saturation uses a one-sided lower
+    confidence bound (t-interval on the n_colonies paired ratios r_k(colony) =
+    MI_k(colony)/MI_max(colony)) rather than the previous two-sided difference test; a
+    percentile-bootstrap-of-ratio-of-means version is also computed as a cross-check and
+    reported alongside, since t-intervals with as few as 4-5 colonies can be fragile.
+    n_colonies is computed per marker from the actual data (previously hardcoded to 5,
+    which is wrong for at least one condition with only 4 colonies). show_margin_line
+    (default True) toggles a second (dashed, unshaded) vertical line at 0.95*MI_max,
+    alongside the existing solid MI_max
+    line+band; the dotted horizontal saturation line now marks the new criterion's k, not
+    the old one. Returns a DataFrame, one row per marker, with: saturation k under the old
+    (two-sided difference) criterion and the new (non-inferiority) criterion, the
+    bootstrap cross-check's saturation k, the all-signals mean MI, the empirical-max mean
+    MI and the k at which it occurs, and the new criterion's lower confidence bound at its
+    selected k. signames_simple: {true signal name: display label} dict (not a
+    positionally-parallel list) -- labels are looked up by name, so this stays correct
+    regardless of what order `signals` is in, e.g. if `signals` is reordered from the
+    default to change the tiebreak priority in getmaxDecoderMI. exhaustive_best: optional
+    {marker: {k: MI_value}} dict (k an int round number, e.g. 1 and 2) -- when given,
+    overlays an open circle at that raw MI value on round k's row, on top of (not
+    replacing) the existing bar, e.g. to show the best MI achievable by ANY size-k signal
+    subset, not just the one on the greedy path. checkoverfit: NOT implemented -- raises
+    NotImplementedError if True, since sig2fate never computes a real in-sample
+    prediction (see sig2fate's and getPreds's docstrings); kept as a parameter only so
+    call sites that still pass checkoverfit=False don't need to change. recompute: passed through to getPreds --
+    forces retraining even when a cached CSV already exists (e.g. after a fix to sig2fate,
+    since a stale cache is otherwise loaded silently). pred_cache_dir: also passed through
+    to getPreds -- overrides where the prediction cache is read/written, separately from
+    dataDir (which here still controls figure output paths, unaffected by this).
+    max_workers: also passed through to getPreds -- trains missing combinations within
+    each round concurrently across that many worker processes instead of one at a time.
+    WARNING: on MPS, max_workers>1 is a correctness hazard (confirmed to silently produce
+    different/worse trained models than sequential training), not just a performance
+    tradeoff -- see getPreds's docstring; leave at 1 unless training on CPU."""
 
     if not plotparam: plotparam = {'fs':15, 'fs2':19, 'fs3':15, 'xlabel': 'cumulative MI (bits)','labelpad':-10, 'x':0.46,'round':2, 'marg':0.01}
-    
+
+    N_BOOT = 2000
+    rng = np.random.default_rng(0)
+    summary_records = []
+
     for fatemarker in markergenes:
 
         print('=========='+fatemarker+'====================')
-        
+
         data_cond = data[data['condition']==cond]
         maxMI_dict = {0: {fatemarker:((), 0)}}
         remaining_sigs = signals
         MI_dec = {}
         rd = 1
-    
+
         while len(remaining_sigs) > 0:
-        
+
             print('rd: '+str(rd))
             signal_chains = [maxMI_dict[rd-1][fatemarker][0] + (s,) for s in remaining_sigs]
 
-            mean_preds, mean_train_preds = getPreds(data, cond, dataDir, signal_chains, fatemarker, markergenes, hyperparam, N_run)
             if checkoverfit:
-                maxMI_dict[rd], MI_dec[rd] = getmaxDecoderMI([fatemarker], signals, mean_train_preds, data_cond, debug=False)
-            else:
-                maxMI_dict[rd], MI_dec[rd] = getmaxDecoderMI([fatemarker], signals, mean_preds, data_cond, debug=False)
-                
+                raise NotImplementedError("checkoverfit=True is not implemented -- sig2fate never "
+                                           "computes a real in-sample ('training') prediction, only "
+                                           "a placeholder equal to the held-out prediction (see "
+                                           "sig2fate's docstring), so there is nothing meaningful to "
+                                           "check overfitting against. Implement a genuine in-sample "
+                                           "prediction in sig2fate first if this is needed.")
+            mean_preds, _ = getPreds(data, cond, dataDir, signal_chains, fatemarker, markergenes, hyperparam, N_run, recompute=recompute, pred_cache_dir=pred_cache_dir, max_workers=max_workers)
+            maxMI_dict[rd], MI_dec[rd] = getmaxDecoderMI([fatemarker], signals, mean_preds, data_cond, debug=False)
+
             maxMIsigs = maxMI_dict[rd][fatemarker][0]
             remaining_sigs = [s for s in signals if s not in list(maxMIsigs)]
             rd += 1
-    
+
         # MAKE THE PLOT
         #------------------------------------------------------------------------------------------------
 
         N_signals = len(signals)
         signals_ordered = list(maxMI_dict[N_signals][fatemarker][0])
-        perm = [signals.index(item) for item in signals_ordered]
-        labels = [signames_simple[i] for i in perm]
-        
+        labels = [signames_simple[s] for s in signals_ordered]
+
+        n_colonies = len(np.unique(data_cond['Colony']))
+
         fig,ax = plt.subplots(1,1, figsize=(4,5))
-        
+
         if title:
             plt.title(fatemarker,fontsize=26, pad=10, fontweight='bold',color = [0, 0.8, 0.8], path_effects=[pe.withStroke(linewidth=1, foreground="black")])
         maxMItotal = 0
         xlim = 0
-        #color = 'cornflowerblue'
         color = [0.6,0.6,0.6]
         uniquecolor = [0.8,0.8,0.8]
-        kcutoff = 10
 
-        # find the signaling combination for which the MI is maximal
+        # MI_max: the all-signals round, NOT the empirically highest-scoring round (that's
+        # selected on the data and upward-biased, which would bias every r_k downward).
+        maxMIall = maxMI_dict[N_signals][fatemarker][1]
+        all_signals_MI = float(np.mean(maxMIall))
+
+        # Empirical max kept as a separate diagnostic: if it substantially exceeds the
+        # all-signals MI, adding the last signal(s) is degrading the decoder.
         meanMI = [float(maxMI_dict[i][fatemarker][1].mean()) for i in range(1,len(maxMI_dict))]
-        maxMIidx = meanMI.index(max(meanMI)) + 1 # offset because list above starts at 1 
-        maxMIall = maxMI_dict[maxMIidx][fatemarker][1]
+        empirical_max_k = int(np.argmax(meanMI)) + 1  # offset because list above starts at k=1
+        empirical_max_MI = float(meanMI[empirical_max_k - 1])
 
-        # MI for all signals combined
-        #maxMIall = maxMI_dict[N_signals][fatemarker][1]
-    
+        kcutoff_old = N_signals
+        kcutoff_new = None
+        kcutoff_boot = None
+        lower_bound_at_selected_k = np.nan
+
         for k, s in enumerate(signals_ordered):
-        
+
             MI_mean, MI_std = col_meanstd(MI_dec[1])
-            w = MI_mean.loc[s, fatemarker].iloc[0]
+            # MI_mean/MI_std are indexed by round-1's candidates, which are 1-element
+            # tuples like ('pSMAD1',) -- s here is the bare signal name string, so it must
+            # be wrapped to match. .loc[[key], col], not .loc[key, col] -- bare-tuple loc
+            # access is unsafe on a flat (non-MultiIndex) Index of tuples.
+            w = MI_mean.loc[[(s,)], fatemarker].iloc[0]
             if uniqueMI:
                 u = uniqueMI[fatemarker][s]
             else:
                 u = 0
-            std = MI_std.loc[s, fatemarker].iloc[0]/np.sqrt(5)
+            std = MI_std.loc[[(s,)], fatemarker].iloc[0]/np.sqrt(n_colonies)
             y = k+1
-    
-            # test if total MI is still significantly different from total
+
             maxMIthisrd = maxMI_dict[k+1][fatemarker][1]
+
+            # OLD criterion: two-sided paired t-test of round-k MI vs MI_max.
             t_stat, p_value = sp.stats.ttest_rel(maxMIthisrd, maxMIall, alternative='two-sided')
             print('p value ' + str(p_value))
             if p_value > 0.05:
-                kcutoff = min(kcutoff, k+1)
-                
+                kcutoff_old = min(kcutoff_old, k+1)
+
+            # NEW criterion: per-colony paired ratio r_k(colony) = MI_k(colony) /
+            # MI_max(colony), index-aligned by colony ID, one-sided lower t-interval bound.
+            r_k = (maxMIthisrd / maxMIall).dropna()
+            n = len(r_k)
+            r_mean = r_k.mean()
+            r_sem = r_k.std(ddof=1) / np.sqrt(n)
+            t_crit = sp.stats.t.ppf(0.95, df=n-1)
+            lower_bound_t = r_mean - t_crit * r_sem
+            if kcutoff_new is None and lower_bound_t > 0.95:
+                kcutoff_new = k + 1
+                lower_bound_at_selected_k = lower_bound_t
+
+            # Bootstrap-of-ratio-of-means cross-check: resample colony IDs (same resample
+            # for numerator and denominator, preserving their correlation), ratio of
+            # resampled means, 2.5th percentile as the lower CI bound.
+            colony_ids = maxMIthisrd.index.to_numpy()
+            boot_ratios = np.empty(N_BOOT)
+            for b in range(N_BOOT):
+                resample = rng.choice(colony_ids, size=len(colony_ids), replace=True)
+                boot_ratios[b] = maxMIthisrd.loc[resample].mean() / maxMIall.loc[resample].mean()
+            lower_bound_boot = np.percentile(boot_ratios, 2.5)
+            if kcutoff_boot is None and lower_bound_boot > 0.95:
+                kcutoff_boot = k + 1
+
             maxMIthisrdavg = np.mean(maxMI_dict[k+1][fatemarker][1])
             maxMIthisrdstd = np.std(maxMI_dict[k+1][fatemarker][1])
-            sem = maxMIthisrdstd/np.sqrt(5)
+            sem = maxMIthisrdstd/np.sqrt(n_colonies)
             maxMItotal = max(maxMIthisrdavg, maxMItotal)
-            
+
             if k>0:
                 left = maxMIthisrdavg - w
-                ax.barh(y=y,width=w-u,left=left,color=color) 
-                ax.barh(y=y,width=u,left=left+w-u,color=uniquecolor) 
+                ax.barh(y=y,width=w-u,left=left,color=color)
+                ax.barh(y=y,width=u,left=left+w-u,color=uniquecolor)
                 ax.errorbar(left+w,y,xerr=sem,capsize=3,color='k')
                 ax.text(left - plotparam['marg'], y, labels[k], va='center', ha='right', fontsize=plotparam['fs3'])
-                #ax.text(left + marg, y, labels[k], va='center', ha='left', fontsize=fs, path_effects=[pe.withStroke(linewidth=3, foreground="white")])
             else:
                 ax.barh(y=y, width=w-u, color=color)
-                ax.barh(y=y,width=u,left=w-u,color=uniquecolor) 
+                ax.barh(y=y,width=u,left=w-u,color=uniquecolor)
                 ax.errorbar(w,y,xerr=sem,capsize=3,color='k')
                 ax.text(float(plotparam['marg']), y, labels[k], va='center', ha='left', fontsize=plotparam['fs3'], path_effects=[pe.withStroke(linewidth=5, foreground="white")])
-        
+
+            if exhaustive_best and fatemarker in exhaustive_best and (k+1) in exhaustive_best[fatemarker]:
+                ax.scatter(exhaustive_best[fatemarker][k+1], y, facecolors='none', edgecolors='k',
+                           marker='o', s=plotparam.get('exhaustive_ms', 80), linewidths=1.5, zorder=5)
+
+        if kcutoff_new is None:
+            kcutoff_new = N_signals
+        if kcutoff_boot is None:
+            kcutoff_boot = N_signals
+
         ax.set_yticks([])
-    
+
         totalmean = np.mean(maxMIall)
-        totalsem = np.std(maxMIall)/np.sqrt(5)
-        xlim = totalmean*1.1 
-        
-        ax.axhline(y=kcutoff + 0.5, xmin=0, xmax=1, color='k', linestyle=':', linewidth=2, zorder=10)
+        totalsem = np.std(maxMIall)/np.sqrt(n_colonies)
+        xlim = totalmean*1.1
+
+        ax.axhline(y=kcutoff_new + 0.5, xmin=0, xmax=1, color='k', linestyle=':', linewidth=2, zorder=10)
         ax.axvspan(xmin=totalmean-totalsem, xmax=totalmean+totalsem, color='k', alpha=0.1, zorder=0)
-        ax.axvline(x=np.mean(maxMIall), ymin=0, ymax=k+1, color='k', linestyle='-', linewidth=1, zorder=0, alpha=0.5)
-        
-        #ax.set_yticks(range(1,1+N_signals),labels=labels)
+        ax.axvline(x=totalmean, ymin=0, ymax=k+1, color='k', linestyle='-', linewidth=1, zorder=0, alpha=0.5)
+        if show_margin_line:
+            ax.axvline(x=0.95*totalmean, ymin=0, ymax=k+1, color='k', linestyle='--', linewidth=1, zorder=0, alpha=0.5)
+
         plt.xlim([0,xlim])
         plt.ylim([1/4, N_signals+3/4])
         plt.xticks([0,np.round(np.mean(maxMIall),plotparam['round'])],labels=['0',str(np.round(np.mean(maxMIall),plotparam['round']))], fontsize=plotparam['fs'])
         ax.set_xlabel(plotparam['xlabel'], fontsize=plotparam['fs2'], labelpad=plotparam['labelpad'], x=plotparam['x'])
-        
+
         for spine in ax.spines.values():
             spine.set_linewidth(2)
-        
-        ax.set_box_aspect(1) #ax.set_aspect('equal', adjustable='box')
-        plt.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.15) 
-        #plt.tight_layout()
-        
-        #plt.tight_layout(pad=0)
+
+        ax.set_box_aspect(0.9)
+        plt.subplots_adjust(left=0.05, right=0.95, top=0.85, bottom=0.15)
 
         # Save core fate markers in Fig3, and the rest in FigS4
-        
+
         if fatemarker in ['ISL1', 'TFAP2C', 'SOX17', 'TBXT', 'TBX6', 'NANOG', 'SOX2']:
             print(fatemarker + " core")
             file_prefix = 'Fig3'
@@ -1519,35 +1798,55 @@ def plotCumulativeMI(data, cond, dataDir, markergenes, signals, signames_simple,
             file_prefix = 'FigS6'
         else:
             file_prefix = 'FigS4'
-            
-        if checkoverfit:
-            fname = file_prefix + '/cumulativeMI_' + fatemarker + '_' + cond + '_' + str(len(signals)) + 'D' + '_train.png'
-        else:
-            fname = file_prefix  + '/cumulativeMI_' + fatemarker + '_' + cond + '_' + str(len(signals)) + 'D' + '.png'
+
+        out_dir = dataDir + '/' + file_prefix
+        os.makedirs(out_dir, exist_ok=True)
+        fname = out_dir + '/cumulativeMI_' + fatemarker + '_' + cond + '_' + str(len(signals)) + 'D' + '.png'
         plt.savefig(fname)
-        
-def getmaxDecoderMI(genelist, signal_names, pred, data, debug=False):
+
+        summary_records.append({
+            'marker': fatemarker,
+            'n_colonies': n_colonies,
+            'saturation_k_old': kcutoff_old,
+            'saturation_k_new': kcutoff_new,
+            'saturation_k_bootstrap': kcutoff_boot,
+            'all_signals_MI': all_signals_MI,
+            'empirical_max_MI': empirical_max_MI,
+            'empirical_max_k': empirical_max_k,
+            'lower_bound_at_selected_k': lower_bound_at_selected_k,
+        })
+
+    return pd.DataFrame(summary_records).set_index('marker')
+ 
+def getmaxDecoderMI(genelist, signal_names, pred, data, debug=False, n_neighbors=3):
     # for genes in genelist, return the signal or signaling combination (keys in pred) that provides the highest decoder-based MI
-    # 
+    #
     # list: list of marker gene names
-    # pred: dictionary: keys are tuples of signals, values are predictions of fate markers based on the signals 
+    # pred: dictionary: keys are tuples of signals, values are predictions of fate markers based on the signals
+    # n_neighbors: passed to sklearn's mutual_info_regression (its own default is 3, which
+    # is what every prior call here relied on implicitly -- exposed as a parameter so
+    # estimator sensitivity can be checked without changing the default behavior)
     
     colonies = [int(n) for n in np.unique(data['Colony'])]
-    MI_dec = {} 
-    MI_dec_mean = pd.DataFrame(np.zeros((len(pred.keys()),len(genelist))), index=pred.keys(), columns=genelist)
+    pred_keys = list(pred.keys())
+    MI_dec = {}
+    MI_dec_mean = pd.DataFrame(np.zeros((len(pred_keys),len(genelist))), index=pred_keys, columns=genelist)
     maxMI_signal_for_gene = {}
 
     for f in genelist:
 
         # calculate MI for each combination of signals in pred
         #-----------------------------------------------------
-        MI_dec[f] = pd.DataFrame(np.zeros((len(pred.keys()),len(colonies))), index=pred.keys(), columns=colonies)
-
-        for ci in colonies:
+        # Filled via a plain numpy array (integer position), not DataFrame.at[], since
+        # pred_keys are tuples -- pandas' .at can misinterpret a tuple row label as a
+        # multi-part indexer rather than a single label once it falls onto its
+        # non-unique-axes fallback path, raising "Invalid call for scalar access".
+        values = np.zeros((len(pred_keys), len(colonies)))
+        for ci_pos, ci in enumerate(colonies):
             idx = data['Colony']==ci
-
-            for s in pred.keys():
-                MI_dec[f].at[s,ci] = sklearn.feature_selection.mutual_info_regression(pred[s].loc[idx,f].to_numpy().reshape(-1, 1), data.loc[idx,f].to_numpy())/np.log(2)
+            for s_pos, s in enumerate(pred_keys):
+                values[s_pos, ci_pos] = sklearn.feature_selection.mutual_info_regression(pred[s].loc[idx,f].to_numpy().reshape(-1, 1), data.loc[idx,f].to_numpy(), n_neighbors=n_neighbors)/np.log(2)
+        MI_dec[f] = pd.DataFrame(values, index=pred_keys, columns=colonies)
 
         MI_dec_mean[f] = MI_dec[f].mean(axis=1)  # Mean across colonies (columns)
         if debug: print(MI_dec_mean)
@@ -1559,19 +1858,24 @@ def getmaxDecoderMI(genelist, signal_names, pred, data, debug=False):
         alpha = 0.1
         
         best_idx = MI_dec_mean[f].idxmax()
-        best_mi = MI_dec[f].loc[best_idx]
-        print(f'best mean: {best_idx}, {MI_dec[f].loc[best_idx].mean():.2f}({MI_dec[f].loc[best_idx].std():.2f})')
-        
+        # .loc[[key]].iloc[0], not .loc[key] -- pandas tries to unpack a bare tuple key as
+        # a multi-axis (row, col, ...) indexer rather than a single row label, regardless
+        # of the tuple's length, which either raises ("Too many indexers" for len>2) or
+        # silently looks up the wrong thing (misreads a 1- or 2-element tuple as row/col
+        # selectors). Wrapping in a list forces "select these row labels" instead.
+        best_mi = MI_dec[f].loc[[best_idx]].iloc[0]
+        print(f'best mean: {best_idx}, {best_mi.mean():.2f}({best_mi.std():.2f})')
+
         p_values = []
         rejected = []
         for s in MI_dec_mean.index:
             if s != best_idx:
-                current_mi = MI_dec[f].loc[s]
-                
+                current_mi = MI_dec[f].loc[[s]].iloc[0]
+
                 # Check if data is valid (not identical, not NaN)
                 if not current_mi.equals(best_mi) and len(current_mi) > 1:
                     # paired ttest: MIs for each colony for different signals
-                    _, p = sp.stats.ttest_rel(best_mi, current_mi) 
+                    _, p = sp.stats.ttest_rel(best_mi, current_mi)
                     p_values.append((s, p))
                     if debug: print(f'{s}, {current_mi.mean():.2f}({current_mi.std():.2f}), p:{p:.3f}')
 
@@ -1584,8 +1888,8 @@ def getmaxDecoderMI(genelist, signal_names, pred, data, debug=False):
         # Check if best is significantly better than all others
         if all(rejected):  # All comparisons significant
             selected = best_idx
-            maxMI_signal_for_gene[f] = (best_idx, MI_dec[f].loc[best_idx])
-            print(f'selected best: {best_idx}, {MI_dec[f].loc[best_idx].mean():.2f}({MI_dec[f].loc[best_idx].std():.2f})')
+            maxMI_signal_for_gene[f] = (best_idx, best_mi)
+            print(f'selected best: {best_idx}, {best_mi.mean():.2f}({best_mi.std():.2f})')
         else:
             # Identify which variables are NOT significantly different from best
             equivalent_vars = [best_idx] + [indices[i] for i, rej in enumerate(rejected) if not rej]
@@ -1606,14 +1910,30 @@ def getmaxDecoderMI(genelist, signal_names, pred, data, debug=False):
             equivalent_vars_sorted = sorted(equivalent_vars, key=get_sort_key)
             print('selected best: '+str(equivalent_vars_sorted))
             
-            #maxMI_signal_for_gene[f] = (equivalent_vars_sorted[0], MI_dec_mean.loc[equivalent_vars_sorted[0]].iloc[0])
-            maxMI_signal_for_gene[f] = (equivalent_vars_sorted[0], MI_dec[f].loc[equivalent_vars_sorted[0]])
+            maxMI_signal_for_gene[f] = (equivalent_vars_sorted[0], MI_dec[f].loc[[equivalent_vars_sorted[0]]].iloc[0])
 
     # maxMI signal for gene is array with values for each colony
     return maxMI_signal_for_gene, MI_dec
 
 
-def plotRedundantMI(dataDir, data, cond, markergenes, signals, N_run, hyperparam):
+def plotRedundantMI(dataDir, data, cond, markergenes, signals, N_run, hyperparam, out_dir=None, recompute=False, pred_cache_dir=None, max_workers=1):
+    """Per-marker redundancy plot: empirical-max decoder MI vs. sum of individual-signal
+    MI (top panel), and their ratio (bottom panel), across markergenes. dataDir is only
+    used for getPreds's prediction cache (unless pred_cache_dir overrides that), not for
+    where figures are saved -- out_dir controls that, and defaults to dataDir + '/FigS4'
+    if not given, matching this function's historical (hardcoded) behavior. recompute:
+    passed through to getPreds -- forces retraining even when a cached CSV already
+    exists. pred_cache_dir: also passed through to getPreds -- overrides where the
+    prediction cache is read/written, separately from dataDir/out_dir. max_workers: also
+    passed through to getPreds -- trains missing combinations within each round
+    concurrently across that many worker processes instead of one at a time.
+    WARNING: on MPS, max_workers>1 is a correctness hazard (confirmed to silently produce
+    different/worse trained models than sequential training), not just a performance
+    tradeoff -- see getPreds's docstring; leave at 1 unless training on CPU."""
+
+    if out_dir is None:
+        out_dir = dataDir + '/FigS4'
+    os.makedirs(out_dir, exist_ok=True)
 
     maxMI = {}
     sumMI = {}
@@ -1633,7 +1953,7 @@ def plotRedundantMI(dataDir, data, cond, markergenes, signals, N_run, hyperparam
             print('rd: '+str(rd))
             signal_chains = [maxMI_dict[rd-1][fatemarker][0] + (s,) for s in remaining_sigs]
 
-            mean_preds, mean_train_preds = getPreds(data, cond, dataDir, signal_chains, fatemarker, markergenes, hyperparam, N_run)
+            mean_preds, mean_train_preds = getPreds(data, cond, dataDir, signal_chains, fatemarker, markergenes, hyperparam, N_run, recompute=recompute, pred_cache_dir=pred_cache_dir, max_workers=max_workers)
             maxMI_dict[rd], MI_dec[rd] = getmaxDecoderMI([fatemarker], signals, mean_preds, data_cond, debug=False)
             maxMIsigs = maxMI_dict[rd][fatemarker][0]
             remaining_sigs = [s for s in signals if s not in list(maxMIsigs)]
@@ -1670,7 +1990,7 @@ def plotRedundantMI(dataDir, data, cond, markergenes, signals, N_run, hyperparam
     plt.gca().invert_yaxis()
     plt.tight_layout()
     
-    fname = 'FigS4/MI_redundancy_' + str(len(signals)) + 'D.png'
+    fname = out_dir + '/MI_redundancy_' + str(len(signals)) + 'D.png'
     plt.savefig(fname)
     
     
@@ -1694,7 +2014,7 @@ def plotRedundantMI(dataDir, data, cond, markergenes, signals, N_run, hyperparam
     plt.gca().invert_yaxis()
     plt.tight_layout()
     
-    fname = 'FigS4/MI_redundancyratio_' + str(len(signals)) + 'D.png'
+    fname = out_dir + '/MI_redundancyratio_' + str(len(signals)) + 'D.png'
     plt.savefig(fname)
     #plt.legend()
 
@@ -1863,17 +2183,6 @@ def return_fates(data, thresh=1):
     TBXT_scaled = data['TBXT']/thresh['TBXT']
     NANOG_scaled = data['NANOG']/thresh['NANOG']
     SOX2_scaled = data['SOX2']/thresh['SOX2']
-
-
-    # PGCLC = TFAP2C & SOX17 
-    # #AMLC = (ISL1 | TFAP2C) & ~PGCLC
-    # #endo = SOX17 & ~PGCLC
-    # meso = TBXT & TBX6 & ~PGCLC #& ~endo
-    # AMLC = ISL1 & ~PGCLC & ~meso # & ~endo  
-    # PSLC = TBXT & ~PGCLC & ~meso & ~AMLC  #& ~endo # (data['TBXT'] > 100)
-    # pluri = NANOG & SOX2 & ~PGCLC & ~meso & ~AMLC & ~PSLC  # & ~endo 
-    # ecto = ~NANOG & SOX2 & ~PGCLC & ~meso & ~AMLC &~pluri &~PSLC #  & ~endo 
-    # other = ~(ecto | pluri | PSLC | AMLC | meso | PGCLC) #  | endo
 
     PGCLC = TFAP2C & SOX17 
     #endo = SOX17 & ~PGCLC
@@ -2120,7 +2429,8 @@ def plot_category_performance_perfold(perfold_df, labels, fname, fs=20, ms=10, g
 
 
 def plot_perfold_comparison(series, group_col, labels, fname, fs=18, ms=10, xlim=1, legend_labels=None,
-                             row_spacing=1.0, row_height=0.3, offset_range=0.15, alpha=0.4, tick_labels=None):
+                             row_spacing=1.0, row_height=0.3, offset_range=0.15, alpha=0.4, tick_labels=None,
+                             legend_kwargs=None, figsize=None, markers=None, margins=None):
     """Per-fold dot plot comparing multiple datasets/prediction sets (e.g. exp20 vs exp28,
     self vs cross, or several regression methods) at a SINGLE chosen metric, one row per
     category/gene. `series` is a list of (df, score_col, color) triples, each df sharing
@@ -2128,21 +2438,54 @@ def plot_perfold_comparison(series, group_col, labels, fname, fs=18, ms=10, xlim
     group_col for filtering; pass `tick_labels` separately if the y-axis display text
     should differ (e.g. 'marker avg' shown for a 'marker_avg' grouping value). row_height
     sets the figure-height coefficient per label; row_spacing sets the vertical spread of
-    row positions -- independent knobs. To compare several metrics of one dataset against
-    each other instead, use plot_category_performance_perfold."""
+    row positions -- independent knobs. legend_kwargs: optional dict of extra keyword
+    arguments merged into plt.legend (e.g. {'loc': 'upper left', 'bbox_to_anchor': (1.02, 1)}
+    to place the legend outside the axes, to the right, when it would otherwise overlap
+    the data) -- defaults to matplotlib's normal in-axes placement. figsize: overall figure
+    size (width, height) in inches; defaults to (7, row_height*len(labels) + 0.8) as
+    before. Pass a larger figsize explicitly when placing the legend outside the axes via
+    legend_kwargs (wider for a right-side legend, taller for a below legend) -- tight_layout
+    only rearranges the axes within the existing canvas, so without extra room the plot
+    area itself gets compressed to make space for the legend rather than the canvas
+    growing to fit both. markers: optional list of matplotlib marker style strings, one
+    per series (e.g. ['o', 'o', '^', '^'] to encode a second factor -- such as which
+    experiment a series belongs to -- via shape, layered on top of color encoding the
+    first factor); defaults to 'o' for every series when omitted. margins: optional dict
+    of {'left', 'right', 'top', 'bottom'} in inches -- when given, the axes are placed at
+    a FIXED position/size via fig.add_axes instead of plt.tight_layout, and the figure is
+    saved at its exact figsize (no bbox_inches='tight' cropping). Use this to make the
+    plotted box itself (not just the outer canvas) line up in width across multiple calls
+    with different tick-label text (e.g. gene names vs. fate names) -- tight_layout's
+    auto-computed left margin depends on each panel's own longest label, so even identical
+    figsize values otherwise produce differently-sized plot boxes; missing keys default to
+    0. When omitted (default), behavior is unchanged: tight_layout sizing and
+    bbox_inches='tight' on save. To compare several metrics of one dataset against each
+    other instead, use plot_category_performance_perfold."""
 
     tick_labels = tick_labels if tick_labels is not None else labels
-    fig, ax = plt.subplots(figsize=(7, row_height*len(labels) + 0.8))
+    if figsize is None:
+        figsize = (7, row_height*len(labels) + 0.8)
+    markers = markers if markers is not None else ['o'] * len(series)
+    if margins is not None:
+        fig = plt.figure(figsize=figsize)
+        left = margins.get('left', 0)
+        right = margins.get('right', 0)
+        top = margins.get('top', 0)
+        bottom = margins.get('bottom', 0)
+        ax = fig.add_axes([left/figsize[0], bottom/figsize[1],
+                            (figsize[0] - left - right)/figsize[0], (figsize[1] - top - bottom)/figsize[1]])
+    else:
+        fig, ax = plt.subplots(figsize=figsize)
     n = len(series)
     offsets = np.linspace(-offset_range, offset_range, n) if n > 1 else [0]
     row_positions = np.arange(len(labels)) * row_spacing
 
-    for (df, score_col, color), offset in zip(series, offsets):
+    for (df, score_col, color), marker, offset in zip(series, markers, offsets):
         for row_i, label in zip(row_positions, labels):
             fold_vals = df[df[group_col] == label][score_col]
             y = row_i + offset
-            ax.scatter(fold_vals, [y]*len(fold_vals), color=color, s=(ms/2)**2, alpha=alpha, edgecolors='none', zorder=2)
-            ax.scatter(fold_vals.mean(), y, color=color, s=ms**2, alpha=1.0, edgecolors='black', linewidths=0.6, zorder=3)
+            ax.scatter(fold_vals, [y]*len(fold_vals), color=color, marker=marker, s=(ms/2)**2, alpha=alpha, edgecolors='none', zorder=2)
+            ax.scatter(fold_vals.mean(), y, color=color, marker=marker, s=ms**2, alpha=1.0, edgecolors='black', linewidths=0.6, zorder=3)
 
     ax.set_xticks([0, 0.2, 0.4, 0.6, 0.8, 1])
     ax.set_yticks(row_positions, tick_labels)
@@ -2151,12 +2494,15 @@ def plot_perfold_comparison(series, group_col, labels, fname, fs=18, ms=10, xlim
     ax.set_xlim([0, xlim])
     plt.gca().invert_yaxis()
     if legend_labels:
-        legend_handles = [plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=color,
+        legend_handles = [plt.Line2D([0], [0], marker=marker, color='w', markerfacecolor=color,
                                       markersize=ms, label=name)
-                           for (df, score_col, color), name in zip(series, legend_labels)]
-        plt.legend(handles=legend_handles, fontsize=fs - 2)
-    plt.tight_layout()
-    plt.savefig(fname)
+                           for (df, score_col, color), marker, name in zip(series, markers, legend_labels)]
+        plt.legend(handles=legend_handles, fontsize=fs - 2, **(legend_kwargs or {}))
+    if margins is not None:
+        plt.savefig(fname)
+    else:
+        plt.tight_layout()
+        plt.savefig(fname, bbox_inches='tight')
 
 
 
@@ -2215,9 +2561,13 @@ def save_df_as_image(df, filepath, col_width=1.7, row_height=0.4, fontsize=10,
     plt.savefig(filepath, bbox_inches='tight', dpi=200)
     plt.close(fig)
     
-def sig2fate(data, signals, gene_names, N_run, hyperparam):
+def sig2fate(data, signals, gene_names, N_run, hyperparam, return_per_seed=False):
     # returns average prediction for N_runs from list of signals
-    
+    # return_per_seed: if True, also returns {seed_index: prediction_df} -- each seed's
+    # own held-out predictions before averaging, used to assess how much an
+    # ensemble-averaged result depends on the specific seeds versus reflecting genuine
+    # signal. Default False keeps the existing two-value return.
+
     preds = {}
     
     for it in range(N_run):
@@ -2244,9 +2594,9 @@ def sig2fate(data, signals, gene_names, N_run, hyperparam):
             data_test = data[data['Colony'].isin([test_colony])]
             data_train = data[data['Colony'].isin(train_colonies)]
     
-            feat_train = data[signals] 
-            feat_test = data[signals]
-            tar_train = data[gene_names]
+            feat_train = data_train[signals]
+            feat_test = data_test[signals]
+            tar_train = data_train[gene_names]
     
             # run VIB
             vib = VIB(feat_train, tar_train, hyperparam)
@@ -2264,7 +2614,9 @@ def sig2fate(data, signals, gene_names, N_run, hyperparam):
 
     # WARNING: THIS IS A PLACEHOLDER, I SOMEHOW DELETED A VERSION OF THIS CODE THAT RETURNS PREDICTION ON TRAINING DATA TO TEST OVERFITTING, CAN RESTORE LATER
     pred_mean_train_df = pred_mean_df
-    
+
+    if return_per_seed:
+        return pred_mean_df, pred_mean_train_df, preds
     return pred_mean_df, pred_mean_train_df
 
 class VIB:
@@ -2857,7 +3209,9 @@ class MPexperiment(Experiment):
 
 def plot_radial_profiles_comparison(reference_data, figure_configs, columns, align_params_by_key,
                                      out_dir, out_prefix, normalize='background_mode', pred_variants=None,
-                                     reference_label='reference', measured_label='measured'):
+                                     reference_label='reference', measured_label='measured',
+                                     reference_color='black', own_b50_color='gray', measured_color='steelblue',
+                                     ylabel='intensity (ref units)'):
     """Radial profiles: a reference population (e.g. Exp20 B50), each figure_config's own
     B50 control (skipped when its own condition IS B50, to avoid duplicating the measured
     series), measured, and any predicted variants -- one figure per figure_configs entry,
@@ -2887,14 +3241,18 @@ def plot_radial_profiles_comparison(reference_data, figure_configs, columns, ali
     alignment-only comparison with no predictions. reference_label/measured_label:
     legend names for the reference and each figure_config's own-condition series (e.g.
     'Exp20'/'Exp28' for a two-experiment alignment check, vs. the default
-    'reference'/'measured' for fig5-style perturbation-vs-control comparisons)."""
+    'reference'/'measured' for fig5-style perturbation-vs-control comparisons).
+    reference_color/own_b50_color/measured_color: line/band colors for those same three
+    series (each figure_config's own predicted variants are colored via pred_variants
+    instead, one color per entry). ylabel: y-axis label text, shared across all figures."""
     pred_variants = pred_variants or []
     r_max = 350
     N_bins_x = 20
     n_cols = len(columns)
     n_rows = 1
     sw = 2  # spine linewidth
-
+    fs = 12
+    
     def profile(vals, rdist):
         bins_x, mean_v, _, _ = fns_plot.calc_profile_meanvar(
             vals[np.newaxis, :, np.newaxis], rdist[np.newaxis, :, np.newaxis], N_bins_x, r_max)
@@ -2948,16 +3306,16 @@ def plot_radial_profiles_comparison(reference_data, figure_configs, columns, ali
     # position).
     profiles_by_figure = {}
     for data, key, cond, label in figure_configs:
-        series_data = {reference_label: (reference_data, 'black')}
+        series_data = {reference_label: (reference_data, reference_color)}
 
         if cond != 'B50':
             data_own_B50 = data[data['condition'] == 'B50']
             data_own_B50_aligned = apply_alignment(data_own_B50, align_params_by_key[key], columns)
-            series_data['B50'] = (data_own_B50_aligned, 'gray')
+            series_data['B50'] = (data_own_B50_aligned, own_b50_color)
 
         data_cond = data[data['condition'] == cond]
         data_cond_aligned = apply_alignment(data_cond, align_params_by_key[key], columns)
-        series_data[measured_label] = (data_cond_aligned, 'steelblue')
+        series_data[measured_label] = (data_cond_aligned, measured_color)
 
         for pred_source, pred_label, pred_color in pred_variants:
             pred_cond_aligned = apply_alignment(pred_source[(key, cond)], align_params_by_key[key], columns)
@@ -3002,7 +3360,7 @@ def plot_radial_profiles_comparison(reference_data, figure_configs, columns, ali
             for name, (bins_x, mean_v, std_v, color) in profiles_by_figure[label][col].items():
                 ax.fill_between(bins_x, mean_v - std_v, mean_v + std_v, alpha=0.2, color=color, edgecolor='none')
                 ax.plot(bins_x, mean_v, color=color, label=name)
-            ax.set_title(col, fontsize=10)
+            ax.set_title(col, fontsize=fs)
             ax.set_xlim(0, 350)
             ax.set_xticks([0, 350])
             ax.set_ylim(ylims[col])
@@ -3010,12 +3368,12 @@ def plot_radial_profiles_comparison(reference_data, figure_configs, columns, ali
             ax.set_box_aspect(1)
             for spine in ax.spines.values():
                 spine.set_linewidth(sw)
-            ax.tick_params(width=sw, labelsize=10)
+            ax.tick_params(width=sw, labelsize=fs)
 
-        axes[0].legend(fontsize=8, loc='upper right')
+        axes[0].legend(fontsize=fs-2, loc='upper right')
         fig.suptitle(label, fontsize=14)
         fig.supxlabel('radial position')
-        fig.supylabel('intensity (ref units)')
+        fig.supylabel(ylabel)
         plt.savefig(f'{out_dir}/{out_prefix}_{label}.png', bbox_inches='tight')
         plt.show()
 
