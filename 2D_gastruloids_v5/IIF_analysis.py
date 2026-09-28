@@ -8,7 +8,7 @@ import scipy.interpolate as interp
 from scipy.ndimage import gaussian_filter1d
 import sklearn
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import balanced_accuracy_score, f1_score
+from sklearn.metrics import balanced_accuracy_score, f1_score, accuracy_score
 
 from scipy import stats
 
@@ -445,7 +445,19 @@ def exp_loader(exp_name, config, normalize=True, normalization_condition='B50'):
     valid_mask = ~(data[config.signal_names + gene_names].isna() |
                    (data[config.signal_names + gene_names] < 0)).any(axis=1)
     data = data[valid_mask].reset_index(drop=True)
-    
+
+    # RAW_CUTOFF: laser power is kept low enough that legitimate intensities shouldn't
+    # reach this range -- anything above is junk/artifact that slipped through
+    # segmentation. Matches the filter fig4n_5D.ipynb (and other scripts) apply inline;
+    # folded in here so every ExperimentResults-loaded experiment gets it consistently,
+    # rather than only whichever notebooks happened to add it themselves. Applied AFTER
+    # the reindex above, WITHOUT reindexing again -- cached per-cell prediction CSVs
+    # elsewhere are indexed by the cell IDs assigned at that reindex and matched by index
+    # value (not row position), so reindexing again here would silently misalign them.
+    RAW_CUTOFF = 10**4
+    junk_mask = (data[gene_names] > RAW_CUTOFF).any(axis=1)
+    data = data[~junk_mask]
+
     if normalize:
         norm_data = data[data['condition'] == normalization_condition]
         norm_cols = config.signal_names + gene_names
@@ -621,8 +633,37 @@ def create_perturbed_data(data, signal_names, perturbing_sigs, threshold, pertur
                 if sig in signal_names:
                     data_perturbed[sig] = data[sig]
                     data_perturbed_z[sig] = data_z[sig]
-        
+
         return data_perturbed, data_perturbed_z
+
+
+def create_perturbed_data_linear(data, signal_names, perturbing_sig, threshold, preserve_signals=None):
+    """Linear conditional-regression alternative to create_perturbed_data's KNN
+    projection: for each cell, sets perturbing_sig to threshold (same convention as the
+    naive/KNN paths), then shifts every OTHER non-preserved signal by that cell's own
+    fitted linear response to the change in perturbing_sig -- y_pred = y_own +
+    slope*(threshold - x_own), where slope is fit once (plain OLS, np.polyfit degree 1,
+    no regularization/tuning) from perturbing_sig vs. that signal across ALL of data.
+    This preserves each cell's own residual/individual variation (unlike predicting a
+    flat population-level value for every cell), so naive is the literal slope=0
+    degenerate case of this method (y_pred = y_own when slope=0), and a full 1:1 slope
+    would translate every cell by exactly the same amount the perturbing signal shifted.
+    preserve_signals (as in create_perturbed_data): these signals are left completely
+    unchanged (not regressed) -- typically pSMAD1, for consistency with the KNN
+    projection's own preserve_signals convention. perturbing_sig is a single column name
+    (not a list, unlike create_perturbed_data's perturbing_sigs -- this method only
+    supports one perturbing signal, since the regression is bivariate)."""
+    preserve_signals = preserve_signals or []
+    data_perturbed = data.copy()
+    x = data[perturbing_sig].to_numpy()
+    delta = threshold - x
+    for sig in signal_names:
+        if sig == perturbing_sig or sig in preserve_signals:
+            continue
+        slope, intercept = np.polyfit(x, data[sig].to_numpy(), deg=1)
+        data_perturbed[sig] = data[sig].to_numpy() + slope * delta
+    data_perturbed[perturbing_sig] = threshold
+    return data_perturbed
 
 
 def run_vib_predictions(data_dir, data_train, data_test, signal_names, gene_names, 
@@ -673,34 +714,122 @@ def run_vib_predictions(data_dir, data_train, data_test, signal_names, gene_name
     return vib, avg_pred, predictions
 
 
-def fate_histogram(data_cond, exp_result):
-    n_bins = 20  # adjust this number as needed
-    thresh_boundary = 0.5 # boundaries are half maximum of fate
-    colors = list(colmap_fates.values())
+def compute_fate_radial_histogram(data_cond, thresh, n_bins=20, thresh_boundary=0.5):
+    """Per-fate radial DISTRIBUTION for one condition's cells -- a HISTOGRAM (discrete
+    fate calls binned by radial position), not a "profile" in this codebase's other
+    sense: Colony/MPexperiment.radialProfiles (and .plotRadialProfiles) are continuous,
+    smoothed radius-vs-intensity curves for a single signal/gene; this function instead
+    bins cells by CircleEdgeDist, calls return_fates on each, and counts categorical
+    fate labels per bin. Returns three views of that same binned fate-count table:
+    per-radial-bin fate fractions (each bin's cells split by fate, columns sum to 1 per
+    bin -- the data behind fate_histogram's stacked-bar plot), overall (position-
+    marginal) fate proportions across all cells (ignoring radial position entirely), and
+    the inner/outer boundary radius of each fate's radial band. Boundaries are found by
+    normalizing each fate's per-bin abundance curve so its own peak = 1, then scanning
+    bins from edge (bin 0, CircleEdgeDist=0) to center (bin n_bins-1) for the two
+    crossings of thresh_boundary: inner = 0 if already above threshold at the edge, else
+    the first bin center where it rises above threshold; outer = the last bin's center if
+    still above threshold at the center, else the bin center where it falls back below.
+    NaN for a boundary that never crosses. Same binning and boundary-crossing convention
+    used inline in fig4n_5D.ipynb's spatial-distribution cell. fate_histogram is a thin
+    plotting wrapper around this function -- call THIS function directly (not
+    fate_histogram) whenever the numbers themselves are needed rather than a drawn
+    figure, e.g. a parameter sweep comparing many conditions, since fate_histogram
+    discards everything but the plot. Returns (fate_counts_norm, overall_props,
+    boundaries, bin_centers, bin_edges): fate_counts_norm is a DataFrame (index=r_bin,
+    columns=fate names, rows summing to 1); overall_props is a Series (index=fate names);
+    boundaries is a dict {fate: (inner, outer)} in the same CircleEdgeDist units as
+    bin_centers; bin_edges has len(bin_centers)+1 entries (for reconstructing bar widths/
+    plot limits, as fate_histogram does)."""
     fate_names_ordered = list(colmap_fates.keys())
-    N_fates = len(fate_names_ordered)
-        
-    fates, fate_names = return_fates(data_cond, thresh=exp_result.thresh)
-    
-    # bin by radial distance
+
+    fates, _ = return_fates(data_cond, thresh=thresh)
+
     binning = pd.qcut(data_cond['CircleEdgeDist'], q=n_bins, labels=False, duplicates='drop').to_frame(name='r_bin')
     binning['fate'] = fates
 
-    # get bin centers in microns
     bin_edges = pd.qcut(data_cond['CircleEdgeDist'], q=n_bins, duplicates='drop', retbins=True)[1]
     bin_centers = (bin_edges[1:] + bin_edges[:-1]) / 2
 
-    # fate counts per bin
     fate_counts = binning.groupby(['r_bin', 'fate']).size().unstack(fill_value=0)
     fate_counts = fate_counts.reindex(columns=fate_names_ordered, fill_value=0)
 
-    # normalize per fate (each fate peaks at 1) for boundary detection
     fate_counts_byfate = fate_counts.div(fate_counts.sum(axis=0), axis=1)
     fate_counts_byfate_norm = fate_counts_byfate.div(fate_counts_byfate.max(axis=0).replace(0, 1), axis=1)
 
-    # normalize per bin for bar plot
     fate_counts_norm = fate_counts.div(fate_counts.sum(axis=1), axis=0)
-    
+    overall_props = pd.Series(fates).value_counts(normalize=True).reindex(fate_names_ordered, fill_value=0)
+
+    boundaries = {}
+    for fate in fate_names_ordered:
+        if fate not in fate_counts_byfate_norm.columns:
+            boundaries[fate] = (np.nan, np.nan)
+            continue
+        abundance_curve = fate_counts_byfate_norm[fate].values
+        n = len(abundance_curve)
+        inner, outer = np.nan, np.nan
+        if abundance_curve[0] > thresh_boundary:
+            inner = 0
+        if abundance_curve[-1] > thresh_boundary:
+            outer = bin_centers[-1]
+        for b in range(1, n - 1):
+            if abundance_curve[b-1] < thresh_boundary and abundance_curve[b+1] > thresh_boundary:
+                inner = bin_centers[b]
+            elif abundance_curve[b-1] > thresh_boundary and abundance_curve[b+1] < thresh_boundary:
+                outer = bin_centers[b]
+        boundaries[fate] = (inner, outer)
+
+    return fate_counts_norm, overall_props, boundaries, bin_centers, bin_edges
+
+
+def compare_fate_radial_histograms(fate_counts_norm_pred, overall_props_pred, boundaries_pred,
+                                  fate_counts_norm_meas, overall_props_meas, boundaries_meas):
+    """Three scalar agreement metrics between a predicted and a measured
+    compute_fate_radial_histogram() result (same n_bins, so their fate_counts_norm frames
+    align row-for-row by r_bin): (1) mean absolute difference in per-radial-bin fate
+    fraction, averaged over every (bin, fate) cell; (2) mean absolute difference in
+    overall (position-marginal) fate proportion, averaged over fates; (3) mean absolute
+    difference in fate boundary position (inner and outer, each fate), averaged over only
+    the boundary entries defined (non-NaN) in BOTH histograms -- a fate with no detectable
+    band in either is silently skipped rather than penalized, since there's no genuine
+    disagreement to measure there. No cell-by-cell correspondence between predicted and
+    measured cells is assumed or used -- purely distributional, via these summary
+    curves/proportions. Returns (fate_fraction_mad, overall_mad, boundary_mad)."""
+    common_fates = [f for f in fate_counts_norm_pred.columns if f in fate_counts_norm_meas.columns]
+    fate_fraction_mad = np.abs(
+        fate_counts_norm_pred[common_fates].to_numpy() - fate_counts_norm_meas[common_fates].to_numpy()
+    ).mean()
+
+    overall_mad = np.abs(overall_props_pred - overall_props_meas).mean()
+
+    boundary_diffs = []
+    for fate in boundaries_pred:
+        if fate not in boundaries_meas:
+            continue
+        for pred_val, meas_val in zip(boundaries_pred[fate], boundaries_meas[fate]):
+            if np.isnan(pred_val) or np.isnan(meas_val):
+                continue
+            boundary_diffs.append(abs(pred_val - meas_val))
+    boundary_mad = np.mean(boundary_diffs) if boundary_diffs else np.nan
+
+    return fate_fraction_mad, overall_mad, boundary_mad
+
+
+def fate_histogram(data_cond, exp_result):
+    """Radial fate-distribution stacked-bar plot: one bar per radial bin (edge to
+    center), each showing that bin's fate composition. Thin plotting wrapper around
+    compute_fate_radial_histogram -- draws the figure only and returns nothing; call
+    compute_fate_radial_histogram directly (not this function) when the underlying
+    numbers (fate_counts_norm/overall_props/boundaries) are needed rather than a drawn
+    plot, e.g. a parameter sweep comparing many conditions. This is a HISTOGRAM
+    (discrete fate calls binned by radial position) -- distinct from this codebase's
+    other, continuous sense of "profile" (Colony/MPexperiment.radialProfiles /
+    .plotRadialProfiles, a smoothed radius-vs-intensity curve for a single signal/gene)."""
+    colors = list(colmap_fates.values())
+    fate_names_ordered = list(colmap_fates.keys())
+
+    fate_counts_norm, _, _, bin_centers, bin_edges = compute_fate_radial_histogram(data_cond, exp_result.thresh)
+
     # create the stacked bar graph
     # distribution bar plot
     fig, ax = plt.subplots(1, 1, figsize=(4, 3))
@@ -899,18 +1028,34 @@ def run_vib_cross_experiment(data_train_exp, data_test_exp, feat_names, gene_nam
     fit_zscore_alignment (data_test_exp z-scored on its own B50 stats, then rescaled to
     data_train_exp's). Gene targets are NOT scaled -- predictions come out directly in
     data_train_exp's own gene-value scale; align data_test_exp's own measured gene columns
-    onto that scale separately (fit_gene_alignment/apply_alignment)."""
+    onto that scale separately (fit_gene_alignment/apply_alignment). Alongside each run's
+    prediction CSV, also torch.saves the trained model's weights (out_prefix_runN_model.pth)
+    and returns the reloadable VIB wrapper objects in runs['models'] = {it: vib, ...} --
+    lets a caller reuse the EXACT model that produced a given run's predictions later (e.g.
+    for a latent-space visualization), rather than only having the predictions themselves.
+    On a cache hit, the wrapper is reconstructed as VIB(data_train_exp[...], ...) (refits
+    the scalers deterministically from data_train_exp, same as at save time) with its
+    .model overwritten by the loaded weights -- same reload pattern used elsewhere in this
+    codebase for a pretrained model. runs['models'] only contains entries for runs that
+    have a saved model file; older caches from before this existed will be missing until
+    recomputed."""
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
     tag = f'[{label}] ' if label else ''
     signal_align_params = fit_zscore_alignment(data_test_exp, data_train_exp, feat_names)
     data_test_exp_aligned = apply_alignment(data_test_exp, signal_align_params, feat_names)
     runs = {}
+    models = {}
     for it in range(N_run):
         out_path = f'{out_dir}/{out_prefix}_run{it}.csv' if out_dir else None
+        model_path = f'{out_dir}/{out_prefix}_run{it}_model.pth' if out_dir else None
         if out_path is not None and not recompute and os.path.exists(out_path):
             print(f'{tag}Run {it}/{N_run} -- already exists, loading: {out_path}')
             runs[it] = pd.read_csv(out_path, index_col=0)
+            if model_path is not None and os.path.exists(model_path):
+                vib_loaded = VIB(data_train_exp[feat_names], data_train_exp[gene_names], hyperparam)
+                vib_loaded.model = torch.load(model_path, weights_only=False)
+                models[it] = vib_loaded
             continue
         print(f'{tag}Run {it}/{N_run}')
         start = time.time()
@@ -927,11 +1072,15 @@ def run_vib_cross_experiment(data_train_exp, data_test_exp, feat_names, gene_nam
         pred_df.loc[tar_predict.index, tar_predict.columns] = tar_predict
         if out_path is not None:
             pred_df.to_csv(out_path)
+        if model_path is not None:
+            torch.save(vib.model, model_path)
         runs[it] = pred_df
+        models[it] = vib
         print(f'{tag}Elapsed time: {time.time() - start:.1f} seconds')
     avg_pred = runs[0].copy()
     avg_pred[gene_names] = pd.concat([df[gene_names] for df in runs.values()]).groupby(level=0).mean()
     runs['avg'] = avg_pred
+    runs['models'] = models
     return runs
 
 def run_vib_joint_experiments(exp_results_list, train_configs, test_configs, signal_names,
@@ -984,7 +1133,13 @@ def run_vib_joint_experiments(exp_results_list, train_configs, test_configs, sig
 
     Returns (avg_preds, predictions): avg_preds is {(exp_name, cond): averaged-over-runs
     prediction df, in exp_name's own raw gene units}; predictions is
-    {(exp_name, cond): {it: pred_df, 'avg': avg_pred_df}} for inspecting individual runs."""
+    {(exp_name, cond): {it: pred_df, 'avg': avg_pred_df}} for inspecting individual runs.
+    For each train_configs key only, predictions[key]['fold_models_by_colony'] is also
+    populated: {it: {colony_id: vib}}, the actual trained VIB wrapper (with .model.encode
+    usable directly) from whichever Phase 1 fold held that colony out -- so a genuinely
+    held-out per-cell encoding (e.g. for a latent-space plot) can look up, for any cell in
+    that colony, the specific model that never saw it during training. Not populated for
+    test_configs keys, which have no held-out folds (Phase 2 trains on everything)."""
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
     tag = f'[{label}] ' if label else ''
@@ -1031,6 +1186,7 @@ def run_vib_joint_experiments(exp_results_list, train_configs, test_configs, sig
 
     predictions = {key: {} for key in all_configs}
     test_exp_names = sorted({exp_name for exp_name, _ in test_configs})
+    all_fold_models = {}  # it -> {train_config key: {held-out colony ID: vib}}
 
     for it in range(N_run):
         print(f'{tag}Run {it}/{N_run}')
@@ -1044,40 +1200,76 @@ def run_vib_joint_experiments(exp_results_list, train_configs, test_configs, sig
 
         # --- Phase 1: leave-one-colony-out CV within train_configs only, cached to disk
         # separately from phase 2 (which run_vib_cross_experiment already caches on its own).
+        # Also saves/reloads each fold's trained model (one .pth per train_config key per
+        # fold), keyed by the ACTUAL held-out colony ID in
+        # fold_model_by_colony[key][colony_id] -- so a caller doing a held-out latent-space
+        # encoding (e.g. for TRULI) can look up, per cell, the specific model that never saw
+        # that cell's colony during training, never a model fit on the same colony it's
+        # being asked to encode. On a cache hit, the reloaded model's scalers are refit on
+        # the same per-fold training subset (_fold_train_data) used to fit them originally,
+        # since a different colony is excluded each fold.
         selfcv_out_path = f'{out_dir}/{out_prefix}_selfcv_run{it}.csv' if out_dir else None
+        fold_model_by_colony = {key: {} for key in train_configs}
+
+        def _fold_train_data(test_rank):
+            """Reconstruct the exact (feat_train, tar_train, test_sets) a given fold uses --
+            shared by the fresh-training path and the cache-hit model-reload path, so a
+            reloaded model's scalers are refit on the SAME subset they were originally fit
+            on (excluding that fold's held-out colony per train_config)."""
+            train_feat, train_tar, test_sets = [], [], {}
+            for exp_name, cond in train_configs:
+                data_cond = get_cond_data(exp_name, cond)
+                colony_fold = colony_folds[(exp_name, cond)]
+                if test_rank in colony_fold:
+                    test_col = colony_fold[test_rank]
+                    test_mask = data_cond['Colony'] == test_col
+                    train_mask = ~test_mask
+                else:
+                    test_mask = pd.Series(False, index=data_cond.index)
+                    train_mask = pd.Series(True, index=data_cond.index)
+                train_feat.append(data_cond[train_mask][signal_names])
+                train_tar.append(data_cond[train_mask][gene_names])
+                if test_mask.any():
+                    test_sets[(exp_name, cond)] = data_cond[test_mask]
+            return pd.concat(train_feat), pd.concat(train_tar), test_sets
+
         if selfcv_out_path is not None and not recompute and os.path.exists(selfcv_out_path):
             print(f'{tag}  self-CV -- already exists, loading: {selfcv_out_path}')
             cached = pd.read_csv(selfcv_out_path, index_col=0, dtype={'_source_exp': str, '_source_cond': str})
             for exp_name, cond in train_configs:
                 subset = cached[(cached['_source_exp'] == exp_name) & (cached['_source_cond'] == cond)]
                 pred_dfs[(exp_name, cond)] = subset.drop(columns=['_source_exp', '_source_cond'])
+            for test_rank in range(n_folds):
+                feat_train = tar_train = None
+                for key in train_configs:
+                    test_col = colony_folds[key].get(test_rank)
+                    if test_col is None:
+                        continue
+                    fold_model_path = (f'{out_dir}/{out_prefix}_selfcv_run{it}_{key[0]}_{key[1]}_fold{test_rank}_model.pth'
+                                        if out_dir else None)
+                    if fold_model_path is not None and os.path.exists(fold_model_path):
+                        if feat_train is None:
+                            feat_train, tar_train, _ = _fold_train_data(test_rank)
+                        vib_loaded = VIB(feat_train, tar_train, hyperparam)
+                        vib_loaded.model = torch.load(fold_model_path, weights_only=False)
+                        fold_model_by_colony[key][test_col] = vib_loaded
         else:
             for test_rank in range(n_folds):
                 print(f'{tag}  fold {test_rank}/{n_folds}')
-                train_feat, train_tar, test_sets = [], [], {}
-                for exp_name, cond in train_configs:
-                    data_cond = get_cond_data(exp_name, cond)
-                    colony_fold = colony_folds[(exp_name, cond)]
-                    if test_rank in colony_fold:
-                        test_col = colony_fold[test_rank]
-                        test_mask = data_cond['Colony'] == test_col
-                        train_mask = ~test_mask
-                    else:
-                        test_mask = pd.Series(False, index=data_cond.index)
-                        train_mask = pd.Series(True, index=data_cond.index)
-                    train_feat.append(data_cond[train_mask][signal_names])
-                    train_tar.append(data_cond[train_mask][gene_names])
-                    if test_mask.any():
-                        test_sets[(exp_name, cond)] = data_cond[test_mask]
+                feat_train, tar_train, test_sets = _fold_train_data(test_rank)
 
-                feat_train = pd.concat(train_feat)
-                tar_train = pd.concat(train_tar)
                 vib = VIB(feat_train, tar_train, hyperparam)
                 _ = vib.train(verbose=False)
 
                 for key, data_test in test_sets.items():
                     tar_predict = vib.predict(data_test[signal_names])
                     pred_dfs[key].loc[tar_predict.index, tar_predict.columns] = tar_predict
+                    test_col = colony_folds[key][test_rank]
+                    fold_model_path = (f'{out_dir}/{out_prefix}_selfcv_run{it}_{key[0]}_{key[1]}_fold{test_rank}_model.pth'
+                                        if out_dir else None)
+                    if fold_model_path is not None:
+                        torch.save(vib.model, fold_model_path)
+                    fold_model_by_colony[key][test_col] = vib
 
             if selfcv_out_path is not None:
                 tagged = []
@@ -1087,6 +1279,8 @@ def run_vib_joint_experiments(exp_results_list, train_configs, test_configs, sig
                     df['_source_cond'] = cond
                     tagged.append(df)
                 pd.concat(tagged).to_csv(selfcv_out_path)
+
+        all_fold_models[it] = fold_model_by_colony
 
         # --- Phase 2: pool ALL train_configs into one combined training dataframe, then
         # reuse run_vib_cross_experiment for the actual full-pool training/prediction
@@ -1125,6 +1319,9 @@ def run_vib_joint_experiments(exp_results_list, train_configs, test_configs, sig
         ).groupby(level=0).mean()
         predictions[key]['avg'] = avg
         avg_preds[key] = avg
+
+    for key in train_configs:
+        predictions[key]['fold_models_by_colony'] = {it: all_fold_models[it][key] for it in range(N_run)}
 
     return avg_preds, predictions
 
@@ -1209,8 +1406,11 @@ def plot_colony_pie_triplet(colony_list, exp_result_list, labels,
     return fig, ax
 
 def plot_latent_entropy_comparison(latent_entropy_results, condition_data_dict,
-                                    figsize=(8, 5), use_ci=True, n_bootstrap=1000):
-    """Bar plot of latent position entropy with colony-level bootstrap."""
+                                    figsize=(8, 5), use_ci=True, n_bootstrap=1000, include_naive=True):
+    """Bar plot of latent position entropy with colony-level bootstrap. include_naive=False
+    drops the naive series (2 bars per perturbation group -- measured, projected -- instead
+    of the default 3), for callers whose latent_entropy_results has no '{key} (naive)'
+    entries."""
 
     def get_ci(label):
         per_cell  = latent_entropy_results[label]['per_cell']
@@ -1253,17 +1453,23 @@ def plot_latent_entropy_comparison(latent_entropy_results, condition_data_dict,
 
     # Perturbation groups
     for i, (key, x) in enumerate(zip(['Z2 MEKi', 'Z2 IWP2', 'X7 TRULI'], x_pos[1:])):
-        bar(ax, x - bar_width, key,              colors['meas'])
-        bar(ax, x,             f'{key} (naive)', colors['naive'])
-        bar(ax, x + bar_width, f'{key} (knn)',   colors['knn'])
+        if include_naive:
+            bar(ax, x - bar_width, key,              colors['meas'])
+            bar(ax, x,             f'{key} (naive)', colors['naive'])
+            bar(ax, x + bar_width, f'{key} (knn)',   colors['knn'])
+        else:
+            bar(ax, x - bar_width / 2, key,            colors['meas'])
+            bar(ax, x + bar_width / 2, f'{key} (knn)', colors['knn'])
 
     ax.set_xticks(x_pos)
     ax.set_xticklabels(['B50', 'MEKi', 'WNTSeci', 'LATSi'], ha='center', fontsize=16)
     ax.tick_params(axis='y', labelsize=14)
     ax.set_ylabel('prediction entropy', fontsize=16)
+    legend_keys = ['meas', 'naive', 'knn'] if include_naive else ['meas', 'knn']
+    legend_labels = ['measured', 'naive', 'projected'] if include_naive else ['measured', 'projected']
     ax.legend(handles=[
-        mpatches.Patch(facecolor=c, edgecolor='black', linewidth=1.5, label=l)
-        for c, l in zip(colors.values(), ['measured', 'naive', 'projected'])
+        mpatches.Patch(facecolor=colors[c], edgecolor='black', linewidth=1.5, label=l)
+        for c, l in zip(legend_keys, legend_labels)
     ], fontsize=15)
 
     plt.tight_layout()
@@ -2334,6 +2540,10 @@ def calcPerformance(data, pred_subs, thresh, gene_names):
     return performances, recall_dict
 
 def compute_category_performance_perfold(true_labels, pred_labels, colonies, category_list, aggregate_name='all'):
+    """Per-fold (colony) category-level performance: balanced accuracy, macro F1 (F1 vs
+    its class-frequency baseline f1_rand for the binary one-vs-rest row), and plain
+    (unbalanced) accuracy -- one row per category plus an aggregate row across all of
+    category_list."""
     records = []
     with warnings.catch_warnings():
         warnings.filterwarnings('ignore', message='y_pred contains classes not in y_true')
@@ -2343,7 +2553,8 @@ def compute_category_performance_perfold(true_labels, pred_labels, colonies, cat
             bal_acc = balanced_accuracy_score(true_labels[colidx], pred_labels[colidx])
             f1_val = f1_score(true_labels[colidx], pred_labels[colidx], labels=category_list, average='macro', zero_division=0)
             f1_rand = 1 / len(category_list)
-            records.append({'fold': colID, 'category': aggregate_name, 'balanced_accuracy': bal_acc, 'f1': f1_val, 'f1_rand': f1_rand})
+            acc = accuracy_score(true_labels[colidx], pred_labels[colidx])
+            records.append({'fold': colID, 'category': aggregate_name, 'balanced_accuracy': bal_acc, 'f1': f1_val, 'f1_rand': f1_rand, 'accuracy': acc})
 
             for cat in category_list:
                 is_cat = true_labels[colidx] == cat
@@ -2353,7 +2564,8 @@ def compute_category_performance_perfold(true_labels, pred_labels, colonies, cat
                 bal_acc = balanced_accuracy_score(is_cat, is_cat_pred)
                 f1_val = f1_score(is_cat, is_cat_pred, average='binary', pos_label=True, zero_division=0)
                 f1_rand = is_cat.mean()
-                records.append({'fold': colID, 'category': cat, 'balanced_accuracy': bal_acc, 'f1': f1_val, 'f1_rand': f1_rand})
+                acc = accuracy_score(is_cat, is_cat_pred)
+                records.append({'fold': colID, 'category': cat, 'balanced_accuracy': bal_acc, 'f1': f1_val, 'f1_rand': f1_rand, 'accuracy': acc})
     return records
 
 
@@ -2376,7 +2588,7 @@ def compute_mse_perfold(true_values, pred_values, colonies, columns, aggregate_n
 
 def compute_marker_performance_perfold(data_cond, pred_sub, colonies, gene_names, thresh):
     """Per-fold (colony), per-marker binary positivity (data > thresh) vs predicted positivity
-    -- balanced accuracy and F1 for the threshold-based call."""
+    -- balanced accuracy, F1, and plain (unbalanced) accuracy for the threshold-based call."""
     records = []
     with warnings.catch_warnings():
         warnings.filterwarnings('ignore', message='y_pred contains classes not in y_true')
@@ -2388,22 +2600,33 @@ def compute_marker_performance_perfold(data_cond, pred_sub, colonies, gene_names
                 bal_acc = balanced_accuracy_score(markerpos, markerpos_pred)
                 f1_val = f1_score(markerpos, markerpos_pred, average='binary', pos_label=1, zero_division=0)
                 f1_rand = markerpos.mean()
-                records.append({'fold': colID, 'gene': marker, 'balanced_accuracy': bal_acc, 'f1': f1_val, 'f1_rand': f1_rand})
+                acc = accuracy_score(markerpos, markerpos_pred)
+                records.append({'fold': colID, 'gene': marker, 'balanced_accuracy': bal_acc, 'f1': f1_val, 'f1_rand': f1_rand, 'accuracy': acc})
     return pd.DataFrame(records)
 
 
-def plot_category_performance_perfold(perfold_df, labels, fname, fs=20, ms=10, group_col='category', tick_labels=None):
-    """Per-fold dot plot for a SINGLE dataset/prediction set: compares its three built-in
-    metrics (f1_rand, f1, balanced_accuracy) against each other, one row per category/gene
-    (whichever column group_col names). `labels` must match the actual values in group_col
-    for filtering; pass tick_labels separately if the y-axis display text should differ. To
-    compare the SAME metric across multiple datasets/experiments instead (e.g. exp20 vs
-    exp28, self vs cross), use plot_perfold_comparison."""
+def plot_category_performance_perfold(perfold_df, labels, fname, fs=20, ms=10, group_col='category',
+                                       tick_labels=None, include_accuracy=False):
+    """Per-fold dot plot for a SINGLE dataset/prediction set: compares its built-in metrics
+    (f1_rand, f1, balanced_accuracy, and -- when include_accuracy=True -- plain accuracy)
+    against each other, one row per category/gene (whichever column group_col names).
+    `labels` must match the actual values in group_col for filtering; pass tick_labels
+    separately if the y-axis display text should differ. include_accuracy defaults to
+    False so existing callers keep their current 3-metric layout/offsets unchanged; pass
+    True to add the 'accuracy' column computed by compute_category_performance_perfold/
+    compute_marker_performance_perfold as a 4th series (firebrick), useful for seeing how
+    much plain accuracy diverges from balanced_accuracy under class imbalance. To compare
+    the SAME metric across multiple datasets/experiments instead (e.g. exp20 vs exp28,
+    self vs cross), use plot_perfold_comparison."""
     tick_labels = tick_labels if tick_labels is not None else labels
     fig, ax = plt.subplots(figsize=(7, 0.31*len(labels) + 0.8))
 
-    metric_colors = {'f1_rand': [0.7,0.7,0.7], 'f1': 'dodgerblue', 'balanced_accuracy': 'k'}
-    offsets = {'f1_rand': 0, 'f1': -0.1, 'balanced_accuracy': 0.1}
+    if include_accuracy:
+        metric_colors = {'f1_rand': [0.7,0.7,0.7], 'f1': 'dodgerblue', 'balanced_accuracy': 'k', 'accuracy': 'firebrick'}
+        offsets = {'f1_rand': 0, 'f1': -0.15, 'balanced_accuracy': 0.05, 'accuracy': 0.15}
+    else:
+        metric_colors = {'f1_rand': [0.7,0.7,0.7], 'f1': 'dodgerblue', 'balanced_accuracy': 'k'}
+        offsets = {'f1_rand': 0, 'f1': -0.1, 'balanced_accuracy': 0.1}
 
     for row_i, cat in enumerate(labels):
         for metric, c in metric_colors.items():
@@ -2430,7 +2653,7 @@ def plot_category_performance_perfold(perfold_df, labels, fname, fs=20, ms=10, g
 
 def plot_perfold_comparison(series, group_col, labels, fname, fs=18, ms=10, xlim=1, legend_labels=None,
                              row_spacing=1.0, row_height=0.3, offset_range=0.15, alpha=0.4, tick_labels=None,
-                             legend_kwargs=None, figsize=None, markers=None, margins=None):
+                             legend_kwargs=None, figsize=None, markers=None, margins=None, sw=None):
     """Per-fold dot plot comparing multiple datasets/prediction sets (e.g. exp20 vs exp28,
     self vs cross, or several regression methods) at a SINGLE chosen metric, one row per
     category/gene. `series` is a list of (df, score_col, color) triples, each df sharing
@@ -2459,8 +2682,11 @@ def plot_perfold_comparison(series, group_col, labels, fname, fs=18, ms=10, xlim
     auto-computed left margin depends on each panel's own longest label, so even identical
     figsize values otherwise produce differently-sized plot boxes; missing keys default to
     0. When omitted (default), behavior is unchanged: tight_layout sizing and
-    bbox_inches='tight' on save. To compare several metrics of one dataset against each
-    other instead, use plot_category_performance_perfold."""
+    bbox_inches='tight' on save. sw: axes spine linewidth; default None leaves
+    matplotlib's own default untouched (unchanged behavior for existing callers that
+    don't pass it) -- pass e.g. sw=2 explicitly to thicken the spines. To compare
+    several metrics of one dataset against each other instead, use
+    plot_category_performance_perfold."""
 
     tick_labels = tick_labels if tick_labels is not None else labels
     if figsize is None:
@@ -2493,6 +2719,9 @@ def plot_perfold_comparison(series, group_col, labels, fname, fs=18, ms=10, xlim
     ax.set_ylim([-row_spacing/2, row_positions[-1] + row_spacing/2])
     ax.set_xlim([0, xlim])
     plt.gca().invert_yaxis()
+    if sw is not None:
+        for spine in ax.spines.values():
+            spine.set_linewidth(sw)
     if legend_labels:
         legend_handles = [plt.Line2D([0], [0], marker=marker, color='w', markerfacecolor=color,
                                       markersize=ms, label=name)
@@ -3211,7 +3440,7 @@ def plot_radial_profiles_comparison(reference_data, figure_configs, columns, ali
                                      out_dir, out_prefix, normalize='background_mode', pred_variants=None,
                                      reference_label='reference', measured_label='measured',
                                      reference_color='black', own_b50_color='gray', measured_color='steelblue',
-                                     ylabel='intensity (ref units)'):
+                                     ylabel='intensity (ref units)', fs=12, legend_only_for=None):
     """Radial profiles: a reference population (e.g. Exp20 B50), each figure_config's own
     B50 control (skipped when its own condition IS B50, to avoid duplicating the measured
     series), measured, and any predicted variants -- one figure per figure_configs entry,
@@ -3244,14 +3473,17 @@ def plot_radial_profiles_comparison(reference_data, figure_configs, columns, ali
     'reference'/'measured' for fig5-style perturbation-vs-control comparisons).
     reference_color/own_b50_color/measured_color: line/band colors for those same three
     series (each figure_config's own predicted variants are colored via pred_variants
-    instead, one color per entry). ylabel: y-axis label text, shared across all figures."""
+    instead, one color per entry). ylabel: y-axis label text, shared across all figures.
+    fs: font size for titles, tick labels, and the legend (legend uses fs-2); defaults
+    to 12, unchanged from before this was exposed as a parameter. legend_only_for: label
+    (matching a figure_configs entry's own label, e.g. 'MEKi') to show the legend on;
+    None (default) shows it only on the first figure_configs entry, by iteration order."""
     pred_variants = pred_variants or []
     r_max = 350
     N_bins_x = 20
     n_cols = len(columns)
     n_rows = 1
     sw = 2  # spine linewidth
-    fs = 12
     
     def profile(vals, rdist):
         bins_x, mean_v, _, _ = fns_plot.calc_profile_meanvar(
@@ -3349,7 +3581,7 @@ def plot_radial_profiles_comparison(reference_data, figure_configs, columns, ali
 
     # --- Pass 2: plot, one figure per figure_configs entry, all columns in a single
     # tightly-spaced row of square panels.
-    for data, key, cond, label in figure_configs:
+    for fig_idx, (data, key, cond, label) in enumerate(figure_configs):
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(1.8*n_cols, 2.5*n_rows),
                                   constrained_layout=True)
         fig.get_layout_engine().set(wspace=0.02, w_pad=0.01)
@@ -3370,7 +3602,9 @@ def plot_radial_profiles_comparison(reference_data, figure_configs, columns, ali
                 spine.set_linewidth(sw)
             ax.tick_params(width=sw, labelsize=fs)
 
-        axes[0].legend(fontsize=fs-2, loc='upper right')
+        show_legend = (label == legend_only_for) if legend_only_for is not None else (fig_idx == 0)
+        if show_legend:
+            axes[0].legend(fontsize=fs-2, loc='upper right')
         fig.suptitle(label, fontsize=14)
         fig.supxlabel('radial position')
         fig.supylabel(ylabel)
