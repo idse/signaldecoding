@@ -871,14 +871,19 @@ def kde_on_grid(L1s, L2s, L1grid_scaled, L2grid_scaled, data_percentile=1):
     print(f"  {np.sum(kde_at_data >= vmin)/len(L1s)*100:.1f}% inside contours")
     return kde_grid, levels
 
-def fit_zscore_alignment(data_self, data_ref, columns, condition='B50'):
-    """Self-standardize each column using data_self's own B50 mean/std, then rescale to
-    data_ref's B50 mean/std -- proper cross-experiment alignment (unlike a StandardScaler
-    fit only on data_ref and applied directly to data_self's raw values, which assumes the
-    two already share similar raw scale and doesn't correct for genuine distributional
-    differences between experiments)."""
-    self_cond = data_self[data_self['condition'] == condition]
-    ref_cond = data_ref[data_ref['condition'] == condition]
+def fit_zscore_alignment(data_self, data_ref, columns, condition='B50', condition_self=None, condition_ref=None):
+    """Self-standardize each column using data_self's own [condition_self or condition]
+    mean/std, then rescale to data_ref's [condition_ref or condition] mean/std -- proper
+    cross-experiment alignment (unlike a StandardScaler fit only on data_ref and applied
+    directly to data_self's raw values, which assumes the two already share similar raw
+    scale and doesn't correct for genuine distributional differences between experiments).
+    condition_self/condition_ref: override `condition` independently per side, for
+    experiments that don't share a condition name (e.g. a disordered-culture experiment,
+    which has no 'B50', aligned onto a micropatterned one's B50)."""
+    condition_self = condition_self if condition_self is not None else condition
+    condition_ref = condition_ref if condition_ref is not None else condition
+    self_cond = data_self[data_self['condition'] == condition_self]
+    ref_cond = data_ref[data_ref['condition'] == condition_ref]
 
     align_params = {}
     for col in columns:
@@ -1018,8 +1023,11 @@ def run_vib_cross_condition(data_train, data_test, feat_names, gene_names, hyper
 
 def run_vib_cross_experiment(data_train_exp, data_test_exp, feat_names, gene_names, hyperparam,
                               N_run=3, out_dir=None, out_prefix='', recompute=False, seed_offset=0,
-                              label=''):
-    """Train on ALL of data_train_exp -- the caller is responsible for restricting this to
+                              label='', train_condition='B50', test_condition='B50'):
+    """train_condition/test_condition: the condition name used to fit the signal alignment
+    on each side (fit_zscore_alignment) -- override independently when the two experiments
+    don't share a condition name (e.g. a disordered-culture experiment, which has no
+    'B50'). Train on ALL of data_train_exp -- the caller is responsible for restricting this to
     whichever training rows are intended (e.g. data[data['condition']=='B50']); this
     function trusts data_train_exp as given rather than filtering internally, so a caller
     that wants to pool training data from multiple sources/conditions can just concatenate
@@ -1042,7 +1050,8 @@ def run_vib_cross_experiment(data_train_exp, data_test_exp, feat_names, gene_nam
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
     tag = f'[{label}] ' if label else ''
-    signal_align_params = fit_zscore_alignment(data_test_exp, data_train_exp, feat_names)
+    signal_align_params = fit_zscore_alignment(data_test_exp, data_train_exp, feat_names,
+                                                condition_self=test_condition, condition_ref=train_condition)
     data_test_exp_aligned = apply_alignment(data_test_exp, signal_align_params, feat_names)
     runs = {}
     models = {}
@@ -2547,6 +2556,7 @@ def compute_category_performance_perfold(true_labels, pred_labels, colonies, cat
     records = []
     with warnings.catch_warnings():
         warnings.filterwarnings('ignore', message='y_pred contains classes not in y_true')
+        warnings.filterwarnings('ignore', message='A single label was found in .y_true. and .y_pred.')
         for colID in np.unique(colonies):
             colidx = (colonies == colID)
 
@@ -2592,6 +2602,7 @@ def compute_marker_performance_perfold(data_cond, pred_sub, colonies, gene_names
     records = []
     with warnings.catch_warnings():
         warnings.filterwarnings('ignore', message='y_pred contains classes not in y_true')
+        warnings.filterwarnings('ignore', message='A single label was found in .y_true. and .y_pred.')
         for colID in np.unique(colonies):
             colidx = colonies == colID
             for marker in gene_names:
@@ -2606,7 +2617,7 @@ def compute_marker_performance_perfold(data_cond, pred_sub, colonies, gene_names
 
 
 def plot_category_performance_perfold(perfold_df, labels, fname, fs=20, ms=10, group_col='category',
-                                       tick_labels=None, include_accuracy=False):
+                                       tick_labels=None, include_accuracy=False, legend=False):
     """Per-fold dot plot for a SINGLE dataset/prediction set: compares its built-in metrics
     (f1_rand, f1, balanced_accuracy, and -- when include_accuracy=True -- plain accuracy)
     against each other, one row per category/gene (whichever column group_col names).
@@ -2615,9 +2626,11 @@ def plot_category_performance_perfold(perfold_df, labels, fname, fs=20, ms=10, g
     False so existing callers keep their current 3-metric layout/offsets unchanged; pass
     True to add the 'accuracy' column computed by compute_category_performance_perfold/
     compute_marker_performance_perfold as a 4th series (firebrick), useful for seeing how
-    much plain accuracy diverges from balanced_accuracy under class imbalance. To compare
-    the SAME metric across multiple datasets/experiments instead (e.g. exp20 vs exp28,
-    self vs cross), use plot_perfold_comparison."""
+    much plain accuracy diverges from balanced_accuracy under class imbalance. legend
+    defaults to False (existing callers' output stays pixel-identical); pass True to add
+    a metric-name legend outside the axes, to the right. To compare the SAME metric
+    across multiple datasets/experiments instead (e.g. exp20 vs exp28, self vs cross),
+    use plot_perfold_comparison."""
     tick_labels = tick_labels if tick_labels is not None else labels
     fig, ax = plt.subplots(figsize=(7, 0.31*len(labels) + 0.8))
 
@@ -2646,8 +2659,17 @@ def plot_category_performance_perfold(perfold_df, labels, fname, fs=20, ms=10, g
     ax.set_ylim([-0.5, len(labels) - 0.5])
     ax.set_xlim([0, 1])
     plt.gca().invert_yaxis()
+
+    if legend:
+        metric_display_names = {'f1_rand': 'F1 (random)', 'f1': 'F1', 'balanced_accuracy': 'balanced accuracy', 'accuracy': 'accuracy'}
+        ax.legend(handles=[
+            mpatches.Patch(facecolor=c if not isinstance(c, list) else tuple(c), edgecolor='black', linewidth=0.6,
+                            label=metric_display_names[metric])
+            for metric, c in metric_colors.items()
+        ], fontsize=fs - 4, loc='upper left', bbox_to_anchor=(1.02, 1))
+
     plt.tight_layout()
-    plt.savefig(fname)
+    plt.savefig(fname, bbox_inches='tight' if legend else None)
 
 
 
@@ -3857,28 +3879,75 @@ def optimize_intensity_scale(vals_self, vals_ref, m_self, m_ref, n_grid=200, n_c
     return scale, shift
 
 
-def dominant_mode_linear(fit):
-    """Linear-intensity position of whichever KDE mode (background or foreground) has more
-    cells under it -- the peak-anchoring point. Reuses an already-computed fits[marker]
-    (see fit_marker_distributions) instead of refitting."""
+def _mode_type_by_majority(fit):
+    """Which KDE mode ('background'=lowest or 'foreground'=highest) has more cells under
+    it, for a single fits[marker] entry. Returns 'background' when only one mode was
+    found (nothing to choose between)."""
+    log_vals, all_modes = fit['log_vals'], fit['all_modes']
+    if len(all_modes) == 1:
+        return 'background'
+    m_lowest, m_high = all_modes.min(), all_modes.max()
+    midpoint = (m_lowest + m_high) / 2
+    return 'background' if np.mean(log_vals < midpoint) >= 0.5 else 'foreground'
+
+
+def mode_linear_by_type(fit, mode_type):
+    """Linear-intensity position of the specified mode type ('background'=lowest mode,
+    'foreground'=highest mode), regardless of which mode has more cells -- falls back to
+    whichever single mode was found if only one exists."""
     log_vals, all_modes, offset = fit['log_vals'], fit['all_modes'], fit['offset']
     if len(all_modes) == 1:
         m_log = all_modes[0]
     else:
-        m_lowest, m_high = all_modes.min(), all_modes.max()
-        midpoint = (m_lowest + m_high) / 2
-        m_log = m_lowest if np.mean(log_vals < midpoint) >= 0.5 else m_high
+        m_log = all_modes.min() if mode_type == 'background' else all_modes.max()
     return 10**m_log - offset
 
 
+def dominant_mode_linear(fit):
+    """Linear-intensity position of whichever KDE mode (background or foreground) has more
+    cells under it -- the peak-anchoring point. Reuses an already-computed fits[marker]
+    (see fit_marker_distributions) instead of refitting. Assumes the two populations being
+    aligned have the same majority fate composition for this marker -- if they don't (e.g.
+    a disordered culture that's majority-negative aligned onto a micropatterned one that's
+    majority-positive for the same marker), this can silently anchor background-to-
+    foreground on the two sides. See fit_gene_alignment's anchor='ref_dominant' option for
+    a fix that doesn't make that assumption."""
+    return mode_linear_by_type(fit, _mode_type_by_majority(fit))
+
+
+def background_mode_linear(fit):
+    """Linear-intensity position of the BACKGROUND (lowest) KDE mode specifically,
+    regardless of which mode has more cells under it -- an alternative to
+    dominant_mode_linear for aligning two populations whose majority fate composition
+    may genuinely differ for this marker, where "most cells" doesn't mean the same thing
+    on both sides. The background/negative population is the more defensible thing to
+    assume comparable across experiments (imaging noise floor) than whichever mode
+    happens to have more cells."""
+    return 10**fit['m'] - fit['offset']
+
+
 def fit_gene_alignment(data_self, data_ref, markers, fits_self=None, fits_ref=None, condition='B50',
-                        bandwidth_scale=1, reg_strength=0.0):
+                        condition_self=None, condition_ref=None, bandwidth_scale=1, reg_strength=0.0,
+                        anchor='dominant'):
     """Peak-anchored shift + log-density-matched scale, per marker, mapping data_self's raw
     units onto data_ref's. Pass fits_self/fits_ref (from fit_marker_distributions) to reuse
     an already-computed KDE fit instead of refitting. bandwidth_scale/reg_strength are
-    forwarded to optimize_intensity_scale."""
-    data_self_cond = data_self[data_self['condition'] == condition]
-    data_ref_cond = data_ref[data_ref['condition'] == condition]
+    forwarded to optimize_intensity_scale. condition_self/condition_ref: override
+    `condition` independently per side, for experiments that don't share a condition name
+    (e.g. a disordered-culture experiment, which has no 'B50'). anchor: 'dominant'
+    (default, unchanged existing behavior) uses dominant_mode_linear -- whichever mode has
+    more cells, independently per side. 'background' always anchors to the low/background
+    mode on both sides, regardless of which has more cells. 'ref_dominant' picks whichever
+    mode type (background or foreground) is dominant on data_ref specifically, then uses
+    THAT SAME mode type on data_self too, even if it isn't dominant there -- lets the
+    reference side decide which mode identity to anchor on, rather than each side deciding
+    independently and potentially picking mismatched mode types (background on one side,
+    foreground on the other) when the two populations' fate composition for a marker
+    genuinely differs, which is exactly what dominant_mode_linear can silently do."""
+    condition_self = condition_self if condition_self is not None else condition
+    condition_ref = condition_ref if condition_ref is not None else condition
+    data_self_cond = data_self[data_self['condition'] == condition_self]
+    data_ref_cond = data_ref[data_ref['condition'] == condition_ref]
 
     fits_self = fits_self or fit_marker_distributions(data_self_cond, markers)
     fits_ref = fits_ref or fit_marker_distributions(data_ref_cond, markers)
@@ -3890,8 +3959,19 @@ def fit_gene_alignment(data_self, data_ref, markers, fits_self=None, fits_ref=No
         vals_ref = data_ref_cond[marker].to_numpy()
         vals_ref = vals_ref[~np.isnan(vals_ref)]
 
-        m_self = dominant_mode_linear(fits_self[marker])
-        m_ref = dominant_mode_linear(fits_ref[marker])
+        if anchor == 'dominant':
+            m_self = dominant_mode_linear(fits_self[marker])
+            m_ref = dominant_mode_linear(fits_ref[marker])
+        elif anchor == 'background':
+            m_self = background_mode_linear(fits_self[marker])
+            m_ref = background_mode_linear(fits_ref[marker])
+        elif anchor == 'ref_dominant':
+            ref_type = _mode_type_by_majority(fits_ref[marker])
+            m_ref = mode_linear_by_type(fits_ref[marker], ref_type)
+            m_self = mode_linear_by_type(fits_self[marker], ref_type)
+        else:
+            raise ValueError(f"anchor must be 'dominant', 'background', or 'ref_dominant', got {anchor!r}")
+
         align_params[marker] = optimize_intensity_scale(vals_self, vals_ref, m_self, m_ref,
                                                           bandwidth_scale=bandwidth_scale,
                                                           reg_strength=reg_strength)
